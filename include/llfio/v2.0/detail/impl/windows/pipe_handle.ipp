@@ -140,11 +140,11 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
     }
     ret.value()._flags |= flag::unlink_on_first_close;
   }
-  // If opening a pipe for reading and not writing, and this pipe is blocking,
-  // block until the other end opens for write
-  if(nativeh.is_readable() && !nativeh.is_writable() && !nativeh.is_nonblocking())
+  // If opening a pipe for reading or writing, and this pipe is blocking,
+  // block until the other end opens
+  if(!nativeh.is_nonblocking())
   {
-    // Opening blocking pipes for reads must block until other end opens with write
+    // Opening blocking pipes must block until other end opens
     if(!ConnectNamedPipe(nativeh.h, nullptr))
     {
       return win32_error();

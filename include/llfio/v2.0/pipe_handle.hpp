@@ -36,10 +36,8 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
 The only fully portable use of this class is to *create* a named pipe with
 read-only privileges (`pipe_create()`), and then to *open* an existing named pipe with
-append-only privileges (`pipe_open()`). This ordering is important - on POSIX opening
-pipes for reads blocks until a writer connects to the other side, and
-opening pipes for writes fails if no reader on the other side is present.
-The Windows implementation of this class matches these POSIX semantics.
+append-only privileges (`pipe_open()`). This ordering is important - it
+works irrespective of whether the pipe is multiplexable or not.
 
 This class doesn't prevent you opening fully duplex pipes
 (i.e. `mode::write`) if your system supports them, but semantics in this
@@ -58,7 +56,9 @@ handle before closing the handle instance, and take over its management.
 If `flag::multiplexable` is specified which causes the handle to
 be created as `native_handle_type::disposition::nonblocking`, opening
 pipes for reads no longer blocks in the constructor. However it will then
-block in `read()`, unless its deadline is zero.
+block in `read()`, unless its deadline is zero. Opening pipes for write
+in nonblocking mode will now fail if there is no reader present on the
+other side of the pipe.
 
 \warning On POSIX neither `creation::only_if_not_exist` nor
 `creation::always_new` is atomic due to lack of kernel API support.

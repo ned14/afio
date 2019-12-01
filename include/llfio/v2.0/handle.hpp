@@ -200,9 +200,8 @@ protected:
   io_context *_ctx{nullptr};  // 8 or 16 bytes
   native_handle_type _v;      // 16 or 28 bytes
   caching _caching{caching::none};
-  char _spare1{0};  // used by pipe_handle
-  char _spare2{0};
-  char _spare3{0};          // 20 or 32 bytes
+  uint8_t _spare1{0};       // used by pipe_handle on Windows to store connectedness
+  uint16_t _spare2{0};      // 20 or 32 bytes
   flag _flags{flag::none};  // 24 or 36 bytes
 
 public:
@@ -228,7 +227,6 @@ public:
       , _caching(o._caching)
       , _spare1(o._spare1)
       , _spare2(o._spare2)
-      , _spare3(o._spare3)
       , _flags(o._flags)
   {
     o._ctx = nullptr;
@@ -251,9 +249,6 @@ public:
     *this = std::move(o);
     o = std::move(temp);
   }
-
-  //! The i/o context this handle will use to multiplex i/o, if any
-  io_context *multiplexer() const noexcept { return _ctx; }
 
   /*! Returns the current path of the open handle as said by the operating system. Note
   that you are NOT guaranteed that any path refreshed bears any resemblance to the original,

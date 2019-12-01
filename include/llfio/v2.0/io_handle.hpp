@@ -25,7 +25,7 @@ Distributed under the Boost Software License, Version 1.0.
 #ifndef LLFIO_IO_HANDLE_H
 #define LLFIO_IO_HANDLE_H
 
-#include "handle.hpp"
+#include "io_context.hpp"
 
 //! \file io_handle.hpp Provides i/o handle
 
@@ -301,6 +301,16 @@ public:
   //! No copy assignment
   io_handle &operator=(const io_handle &) = delete;
 
+  LLFIO_MAKE_FREE_FUNCTION
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> close() noexcept override
+  {
+    if(this->_ctx!=nullptr)
+    {
+      OUTCOME_TRY(set_multiplexer(nullptr));
+    }
+    return handle::close();
+  }
+
   /*! \brief The *maximum* number of buffers which a single read or write syscall can process at a
   time for this specific open handle. On POSIX, this is known as `IOV_MAX`.
 
@@ -319,6 +329,47 @@ public:
   Most of the time this function will return `1`.
   */
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC size_t max_buffers() const noexcept;
+
+  /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null, 
+  then this handle has not been registered with an i/o context yet.
+  */
+  io_context *multiplexer() const noexcept { 
+    return this->_ctx; }
+
+  /*! \brief Sets the i/o context this handle will use to multiplex i/o.
+
+  This function will always fail if `.is_multiplexable()` is false for this handle.
+
+  Note that this call deregisters this handle from any existing i/o context, and registers
+  it with the new i/o context. You must therefore not call it if any i/o is currently
+  outstanding on this handle. You should also be aware that multiple dynamic memory
+  allocations and deallocations may occur, as well as multiple syscalls (i.e. this is
+  an expensive call, try to do it from cold code).
+
+  \mallocs Multiple dynamic memory allocations and deallocations.
+  */
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> set_multiplexer(io_context *c = this_thread::multiplexer()) noexcept
+  {
+    if(!is_multiplexable())
+    {
+      return errc::operation_not_supported;
+    }
+    if(c==this->_ctx)
+    {
+      return success();
+    }
+    if(this->_ctx !=nullptr)
+    {
+      OUTCOME_TRY(this->_ctx->_deregister_io_handle(this));
+      this->_ctx = nullptr;
+    }
+    if(c!=nullptr)
+    {
+      OUTCOME_TRY(c->_register_io_handle(this));
+    }
+    this->_ctx = c;
+    return success();
+  }
 
   /*! \brief Read data from the open handle.
 
@@ -341,6 +392,20 @@ public:
   */
   LLFIO_MAKE_FREE_FUNCTION
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC io_result<buffers_type> read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept;
+  //! Convenience initialiser list based overload for `read()`
+  LLFIO_MAKE_FREE_FUNCTION
+  io_result<size_type> read(extent_type offset, std::initializer_list<buffer_type> lst, deadline d = deadline()) noexcept
+  {
+    buffer_type *_reqs = reinterpret_cast<buffer_type *>(alloca(sizeof(buffer_type) * lst.size()));
+    memcpy(_reqs, lst.begin(), sizeof(buffer_type) * lst.size());
+    io_request<buffers_type> reqs(buffers_type(_reqs, lst.size()), offset);
+    auto ret = read(reqs, d);
+    if(ret)
+    {
+      return ret.bytes_transferred();
+    }
+    return std::move(ret).error();
+  }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(read)
 
@@ -366,7 +431,7 @@ public:
   */
   LLFIO_MAKE_FREE_FUNCTION
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC io_result<const_buffers_type> write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept;
-  //! \overload
+  //! Convenience initialiser list based overload for `write()`
   LLFIO_MAKE_FREE_FUNCTION
   io_result<size_type> write(extent_type offset, std::initializer_list<const_buffer_type> lst, deadline d = deadline()) noexcept
   {
@@ -412,9 +477,95 @@ public:
   \mallocs None.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  virtual io_result<const_buffers_type> barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC io_result<const_buffers_type> barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
+
+#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+  /*! \brief An eager awaitable type, where eager means that the operation is attempted immediately,
+  and if it can be completely immediately without blocking then the awaitable is returned ready.
+  */
+  template<class T> using eager_awaitable = OUTCOME_V2_NAMESPACE::awaitables::eager<T>;
+
+  /*! \brief Read data from the open handle immediately if it would not block, if so
+  the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
+  awaitable shall become ready when the i/o has completed.
+
+  This function will always fail if `.is_multiplexable()` is false for this handle.
+
+  The parameters are as for `.read()`. `.set_multiplexer()` can be used to force the i/o
+  context used to schedule any blocking i/o. If this handle's multiplexer is null,
+  `.set_multiplexer()` is called on your behalf to register this handle with
+  the current thread's i/o context, which is a non-deterministic operation. To avoid
+  that, call `.set_multiplexer()` manually from cold code.
+  */
+  LLFIO_MAKE_FREE_FUNCTION
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<buffers_type>> co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept;
+  //! Convenience initialiser list based overload for `co_read()`
+  LLFIO_MAKE_FREE_FUNCTION
+  eager_awaitable<io_result<size_type>> co_read(extent_type offset, std::initializer_list<buffer_type> lst, deadline d = deadline()) noexcept
+  {
+    buffer_type *_reqs = reinterpret_cast<buffer_type *>(alloca(sizeof(buffer_type) * lst.size()));
+    memcpy(_reqs, lst.begin(), sizeof(buffer_type) * lst.size());
+    io_request<buffers_type> reqs(buffers_type(_reqs, lst.size()), offset);
+    auto ret = co_await co_read(reqs, d);
+    if(ret)
+    {
+      co_return ret.bytes_transferred();
+    }
+    co_return std::move(ret).error();
+  }
+
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_read)
+
+  /*! \brief Write data to the open handle immediately if it would not block, if so
+  the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
+  awaitable shall become ready when the i/o has completed.
+
+  This function will always fail if `.is_multiplexable()` is false for this handle.
+
+  The parameters are as for `.write()`. `.set_multiplexer()` can be used to force the i/o
+  context used to schedule any blocking i/o. If this handle's multiplexer is null,
+  `.set_multiplexer()` is called on your behalf to register this handle with
+  the current thread's i/o context, which is a non-deterministic operation. To avoid
+  that, call `.set_multiplexer()` manually from cold code.
+  */
+  LLFIO_MAKE_FREE_FUNCTION
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<const_buffers_type>> co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept;
+  //! Convenience initialiser list based overload for `co_read()`
+  LLFIO_MAKE_FREE_FUNCTION
+  eager_awaitable<io_result<size_type>> co_write(extent_type offset, std::initializer_list<const_buffer_type> lst, deadline d = deadline()) noexcept
+  {
+    const_buffer_type *_reqs = reinterpret_cast<const_buffer_type *>(alloca(sizeof(const_buffer_type) * lst.size()));
+    memcpy(_reqs, lst.begin(), sizeof(const_buffer_type) * lst.size());
+    io_request<const_buffers_type> reqs(const_buffers_type(_reqs, lst.size()), offset);
+    auto ret = co_await co_write(reqs, d);
+    if(ret)
+    {
+      co_return ret.bytes_transferred();
+    }
+    co_return std::move(ret).error();
+  }
+
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_write)
+
+  /*! \brief Begin the issuing of a write reordering barrier such that writes
+  preceding the barrier will reach storage before writes after this barrier completes.
+  This operation almost never completes immediately.
+
+  This function will always fail if `.is_multiplexable()` is false for this handle.
+
+  The parameters are as for `.barrier()`. `.set_multiplexer()` can be used to force the i/o
+  context used to schedule any blocking i/o. If this handle's multiplexer is null,
+  `.set_multiplexer()` is called on your behalf to register this handle with
+  the current thread's i/o context, which is a non-deterministic operation. To avoid
+  that, call `.set_multiplexer()` manually from cold code.
+  */
+  LLFIO_MAKE_FREE_FUNCTION
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<const_buffers_type>> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
+
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
+#endif
 };
 
 

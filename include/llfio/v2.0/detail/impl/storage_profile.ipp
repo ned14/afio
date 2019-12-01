@@ -391,13 +391,13 @@ namespace storage_profile
   {
     outcome<void> atomic_rewrite_quantum(storage_profile &sp, file_handle &srch) noexcept
     {
-      if(sp.atomic_rewrite_quantum.value != static_cast<io_service::extent_type>(-1))
+      if(sp.atomic_rewrite_quantum.value != static_cast<io_handle::extent_type>(-1))
       {
         return success();
       }
       try
       {
-        using off_t = io_service::extent_type;
+        using off_t = io_handle::extent_type;
         sp.max_aligned_atomic_rewrite.value = 1;
         sp.atomic_rewrite_quantum.value = static_cast<off_t>(-1);
         size_t size = srch.requires_aligned_io() ?
@@ -451,7 +451,7 @@ namespace storage_profile
           {
             concurrency = 4;
           }
-          std::atomic<io_service::extent_type> atomic_rewrite_quantum(sp.atomic_rewrite_quantum.value);
+          std::atomic<io_handle::extent_type> atomic_rewrite_quantum(sp.atomic_rewrite_quantum.value);
           std::atomic<bool> failed(false);
           for(unsigned no = 0; no < concurrency; no++)
           {
@@ -596,7 +596,7 @@ namespace storage_profile
             {
               concurrency = 4;
             }
-            std::atomic<io_service::extent_type> max_aligned_atomic_rewrite(sp.max_aligned_atomic_rewrite.value);
+            std::atomic<io_handle::extent_type> max_aligned_atomic_rewrite(sp.max_aligned_atomic_rewrite.value);
             std::atomic<bool> failed(false);
             for(unsigned no = 0; no < concurrency; no++)
             {
@@ -685,7 +685,7 @@ namespace storage_profile
 
     outcome<void> atomic_rewrite_offset_boundary(storage_profile &sp, file_handle &srch) noexcept
     {
-      if(sp.atomic_rewrite_offset_boundary.value != static_cast<io_service::extent_type>(-1))
+      if(sp.atomic_rewrite_offset_boundary.value != static_cast<io_handle::extent_type>(-1))
       {
         return success();
       }
@@ -697,7 +697,7 @@ namespace storage_profile
 #endif
       try
       {
-        using off_t = io_service::extent_type;
+        using off_t = io_handle::extent_type;
         auto size = static_cast<size_t>(sp.max_aligned_atomic_rewrite.value);
         auto maxsize = static_cast<size_t>(sp.max_aligned_atomic_rewrite.value);
         if(size > 1024)
@@ -757,7 +757,7 @@ namespace storage_profile
               {
                 concurrency = 4;
               }
-              std::atomic<io_service::extent_type> atomic_rewrite_offset_boundary(sp.atomic_rewrite_offset_boundary.value);
+              std::atomic<io_handle::extent_type> atomic_rewrite_offset_boundary(sp.atomic_rewrite_offset_boundary.value);
               std::atomic<bool> failed(false);
               for(unsigned no = 0; no < concurrency; no++)
               {

@@ -21,7 +21,7 @@
 #     (See accompanying file Licence.txt or copy at
 #           http://www.boost.org/LICENSE_1_0.txt)
 
-cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.3 FATAL_ERROR)
 include(cmake/QuickCppLibBootstrap.cmake)
 include(QuickCppLibRequireOutOfSourceBuild)
 include(QuickCppLibUtils)
@@ -195,9 +195,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "FreeBSD" OR APPLE)
   all_link_libraries(PUBLIC ${libcxx_cxxexperimental})
 endif()
 # Set any macros this library requires
-all_compile_definitions(PRIVATE LLFIO_INCLUDE_ASYNC_FILE_HANDLE=1 LLFIO_INCLUDE_STORAGE_PROFILE=1)
+all_compile_definitions(PRIVATE LLFIO_INCLUDE_STORAGE_PROFILE=1)
 foreach(target ${llfio_EXAMPLE_TARGETS})
-  target_compile_definitions(${target} PRIVATE LLFIO_INCLUDE_ASYNC_FILE_HANDLE=1 LLFIO_INCLUDE_STORAGE_PROFILE=1)
+  target_compile_definitions(${target} PRIVATE LLFIO_INCLUDE_STORAGE_PROFILE=1)
 endforeach()
 if(LLFIO_USE_EXPERIMENTAL_SG14_STATUS_CODE)
   all_compile_definitions(PUBLIC LLFIO_EXPERIMENTAL_STATUS_CODE=1)

@@ -248,24 +248,6 @@ public:
   //! The i/o service this handle is attached to, if any
   io_service *service() const noexcept { return _service; }
 
-  using io_handle::read;
-  //! Convenience initialiser list based overload for `read()`
-  LLFIO_MAKE_FREE_FUNCTION
-  io_result<size_type> read(extent_type offset, std::initializer_list<buffer_type> lst, deadline d = deadline()) noexcept
-  {
-    buffer_type *_reqs = reinterpret_cast<buffer_type *>(alloca(sizeof(buffer_type) * lst.size()));
-    memcpy(_reqs, lst.begin(), sizeof(buffer_type) * lst.size());
-    io_request<buffers_type> reqs(buffers_type(_reqs, lst.size()), offset);
-    auto ret = read(reqs, d);
-    if(ret)
-    {
-      return ret.bytes_transferred();
-    }
-    return std::move(ret).error();
-  }
-
-  LLFIO_DEADLINE_TRY_FOR_UNTIL(read)
-
   /*! Return the current maximum permitted extent of the file.
 
   \errors Any of the values POSIX fstat() or GetFileInformationByHandleEx() can return.

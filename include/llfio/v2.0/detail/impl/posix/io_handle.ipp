@@ -31,9 +31,8 @@ Distributed under the Boost Software License, Version 1.0.
 #include <poll.h>
 #include <sys/uio.h>  // for preadv etc
 #include <unistd.h>
-#if LLFIO_USE_POSIX_AIO
-#include <aio.h>
-#endif
+
+#include "quickcpplib/signal_guard.hpp"
 
 LLFIO_V2_NAMESPACE_BEGIN
 
@@ -123,23 +122,26 @@ io_handle::io_result<io_handle::buffers_type> io_handle::read(io_handle::io_requ
     do
     {
       bytesread = ::readv(_v.fd, iov, reqs.buffers.size());
-      if(bytesread < 0)
+      if(bytesread <= 0)
       {
-        if(EWOULDBLOCK != errno && EAGAIN != errno)
+        if(bytesread < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
         {
           return posix_error();
         }
-        LLFIO_POSIX_DEADLINE_TO_SLEEP_LOOP(d);
-        int mstimeout = (timeout == nullptr) ? -1 : (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000LL);
-        pollfd p;
-        memset(&p, 0, sizeof(p));
-        p.fd = _v.fd;
-        p.events = POLLIN | POLLERR;
-        if(-1 == ::poll(&p, 1, mstimeout))
+        if(!d || !d.steady || d.nsecs != 0)
         {
-          return posix_error();
+          LLFIO_POSIX_DEADLINE_TO_SLEEP_LOOP(d);
+          int mstimeout = (timeout == nullptr) ? -1 : (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000LL);
+          pollfd p;
+          memset(&p, 0, sizeof(p));
+          p.fd = _v.fd;
+          p.events = POLLIN | POLLERR;
+          if(-1 == ::poll(&p, 1, mstimeout))
+          {
+            return posix_error();
+          }
         }
-        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d)
+        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
     } while(bytesread <= 0);
   }
@@ -215,24 +217,32 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::
   {
     do
     {
-      byteswritten = ::writev(_v.fd, iov, reqs.buffers.size());
-      if(byteswritten < 0)
+      // Can't guarantee that user code hasn't enabled SIGPIPE
+      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
+                                                                       [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
+                                                                         errno = EPIPE;
+                                                                         return -1;
+                                                                       });
+      if(byteswritten <= 0)
       {
-        if(EWOULDBLOCK != errno && EAGAIN != errno)
+        if(byteswritten < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
         {
           return posix_error();
         }
-        LLFIO_POSIX_DEADLINE_TO_SLEEP_LOOP(d);
-        int mstimeout = (timeout == nullptr) ? -1 : (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000LL);
-        pollfd p;
-        memset(&p, 0, sizeof(p));
-        p.fd = _v.fd;
-        p.events = POLLOUT | POLLERR;
-        if(-1 == ::poll(&p, 1, mstimeout))
+        if(!d || !d.steady || d.nsecs != 0)
         {
-          return posix_error();
+          LLFIO_POSIX_DEADLINE_TO_SLEEP_LOOP(d);
+          int mstimeout = (timeout == nullptr) ? -1 : (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000LL);
+          pollfd p;
+          memset(&p, 0, sizeof(p));
+          p.fd = _v.fd;
+          p.events = POLLOUT | POLLERR;
+          if(-1 == ::poll(&p, 1, mstimeout))
+          {
+            return posix_error();
+          }
         }
-        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d)
+        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
     } while(byteswritten <= 0);
   }
@@ -315,5 +325,179 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
 #endif
   return {reqs.buffers};
 }
+
+#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+io_handle::eager_awaitable<io_handle::io_result<io_handle::buffers_type>> io_handle::co_read(io_request<buffers_type> reqs, deadline d) noexcept
+{
+  LLFIO_LOG_FUNCTION_CALL(this);
+  if(multiplexer() == nullptr)
+  {
+    OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
+  }
+  if(reqs.buffers.size() > IOV_MAX)
+  {
+    co_return errc::argument_list_too_long;
+  }
+  LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
+#if 0
+  struct iovec *iov = (struct iovec *) alloca(reqs.buffers.size() * sizeof(struct iovec));
+  for(size_t n = 0; n < reqs.buffers.size(); n++)
+  {
+    iov[n].iov_base = const_cast<char *>(reqs.buffers[n].data);
+    iov[n].iov_len = reqs.buffers[n].len;
+  }
+#else
+  auto *iov = reinterpret_cast<struct iovec *>(reqs.buffers.data());
+#endif
+#ifndef NDEBUG
+  if(_v.requires_aligned_io())
+  {
+    assert((reqs.offset & 511) == 0);
+    for(size_t n = 0; n < reqs.buffers.size(); n++)
+    {
+      assert((reinterpret_cast<uintptr_t>(iov[n].iov_base) & 511) == 0);
+      assert((iov[n].iov_len & 511) == 0);
+    }
+  }
+#endif
+  ssize_t bytesread = 0;
+  if(is_seekable())
+  {
+    co_return errc::operation_not_supported;
+  }
+  else
+  {
+    do
+    {
+      bytesread = ::readv(_v.fd, iov, reqs.buffers.size());
+      if(bytesread <= 0)
+      {
+        if(bytesread < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
+        {
+          co_return posix_error();
+        }
+        // Don't attempt suspension if this is a poll
+        if(!d || !d.steady || d.nsecs != 0)
+        {
+          // Have my i/o context suspend me until either some data for read turns up, or my deadline expires
+          deadline nd;
+          LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
+          OUTCOME_CO_TRY(co_await io_context::_await_io_handle_ready_awaitable(multiplexer(), this, nullptr, io_context::_io_kind::read, nd));
+        }
+        LLFIO_POSIX_CO_DEADLINE_TO_TIMEOUT_LOOP(d);
+      }
+    } while(bytesread <= 0);
+  }
+  for(size_t i = 0; i < reqs.buffers.size(); i++)
+  {
+    auto &buffer = reqs.buffers[i];
+    if(buffer.size() <= static_cast<size_t>(bytesread))
+    {
+      bytesread -= buffer.size();
+    }
+    else
+    {
+      buffer = {buffer.data(), (size_type) bytesread};
+      reqs.buffers = {reqs.buffers.data(), i + 1};
+      break;
+    }
+  }
+  co_return{reqs.buffers};
+}
+io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> io_handle::co_write(io_request<const_buffers_type> reqs, deadline d) noexcept
+{
+  LLFIO_LOG_FUNCTION_CALL(this);
+  if(multiplexer() == nullptr)
+  {
+    OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
+  }
+  if(reqs.buffers.size() > IOV_MAX)
+  {
+    co_return errc::argument_list_too_long;
+  }
+  LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
+#if 0
+  struct iovec *iov = (struct iovec *) alloca(reqs.buffers.size() * sizeof(struct iovec));
+  for(size_t n = 0; n < reqs.buffers.size(); n++)
+  {
+    iov[n].iov_base = const_cast<char *>(reqs.buffers[n].data);
+    iov[n].iov_len = reqs.buffers[n].len;
+  }
+#else
+  auto *iov = reinterpret_cast<struct iovec *>(reqs.buffers.data());
+#endif
+#ifndef NDEBUG
+  if(_v.requires_aligned_io())
+  {
+    assert((reqs.offset & 511) == 0);
+    for(size_t n = 0; n < reqs.buffers.size(); n++)
+    {
+      assert((reinterpret_cast<uintptr_t>(iov[n].iov_base) & 511) == 0);
+      assert((iov[n].iov_len & 511) == 0);
+    }
+  }
+#endif
+  ssize_t byteswritten = 0;
+  if(is_seekable())
+  {
+    co_return errc::operation_not_supported;
+  }
+  else
+  {
+    do
+    {
+      // Can't guarantee that user code hasn't enabled SIGPIPE
+      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
+                                                                       [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
+                                                                         errno = EPIPE;
+                                                                         return -1;
+                                                                       });
+      if(byteswritten <= 0)
+      {
+        if(byteswritten < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
+        {
+          co_return posix_error();
+        }
+        // Don't attempt suspension if this is a poll
+        if(!d || !d.steady || d.nsecs != 0)
+        {
+          // Have my i/o context suspend me until either some space for write turns up, or my deadline expires
+          deadline nd;
+          LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
+          OUTCOME_CO_TRY(co_await io_context::_await_io_handle_ready_awaitable(multiplexer(), this, nullptr, io_context::_io_kind::write, nd));
+        }
+        LLFIO_POSIX_CO_DEADLINE_TO_TIMEOUT_LOOP(d);
+      }
+    } while(byteswritten <= 0);
+  }
+  for(size_t i = 0; i < reqs.buffers.size(); i++)
+  {
+    auto &buffer = reqs.buffers[i];
+    if(buffer.size() <= static_cast<size_t>(byteswritten))
+    {
+      byteswritten -= buffer.size();
+    }
+    else
+    {
+      buffer = {buffer.data(), (size_type) byteswritten};
+      reqs.buffers = {reqs.buffers.data(), i + 1};
+      break;
+    }
+  }
+  co_return{reqs.buffers};
+}
+io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> io_handle::co_barrier(io_request<const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
+{
+  (void) reqs;
+  (void) kind;
+  (void) d;
+  LLFIO_LOG_FUNCTION_CALL(this);
+  if(is_pipe() || is_socket())
+  {
+    co_return success();  // nothing was flushed
+  }
+  co_return errc::operation_not_supported;
+}
+#endif
 
 LLFIO_V2_NAMESPACE_END

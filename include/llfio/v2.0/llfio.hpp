@@ -62,11 +62,7 @@ import LLFIO_MODULE_NAME;
 #include "stat.hpp"
 #include "utils.hpp"
 
-#ifdef LLFIO_INCLUDE_ASYNC_FILE_HANDLE
-#include "async_file_handle.hpp"
-#else
 #include "file_handle.hpp"
-#endif
 #include "pipe_handle.hpp"
 #include "directory_handle.hpp"
 #include "statfs.hpp"

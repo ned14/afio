@@ -12,7 +12,7 @@
 </table></center>
 
 Herein lies my proposed zero whole machine memory copy async file i/o and filesystem
-library for Boost and the C++ standard, intended for storage devices with ~1 microsecond
+library for the C++ standard, intended for storage devices with ~1 microsecond
 4Kb transfer latencies and those supporting Storage Class Memory (SCM)/Direct Access
 Storage (DAX). Its i/o overhead, including syscall overhead, has been benchmarked to
 100 nanoseconds on Linux which corresponds to a theoretical maximum of 10M IOPS @ QD1,
@@ -33,7 +33,7 @@ source code repository lives at https://github.com/ned14/llfio.
 - Zero malloc, zero exception throw and zero whole system memory copy design used throughout, even down to paths (which can hit 64Kb!).
 - Comprehensive support for virtual and mapped memory of both SCM/DAX and page cached storage, including large, huge and super pages.
 - Works very well with the C++ standard library, and is being proposed for standardisation into C++. See <a href="https://wg21.link/P1031">P1031 *Low level file i/o*</a>.
-- `async_file_handle` supports `co_await` (Coroutines TS).
+- Deep Coroutines TS support, simply `.co_read()` or `.co_write()` from within a coroutine.
 
 \note Note that this code is of late alpha quality. It's quite reliable on Windows and Linux, but be careful when using it!
 

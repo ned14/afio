@@ -2,15 +2,13 @@
 
 These compilers and OSs are regularly tested:
 
-- [GCC](https://gcc.gnu.org/) 7.0 (Linux 4.x x64)
+- [GCC](https://gcc.gnu.org/) 7.4 (Linux 4.x x64)
 - [Clang](https://clang.llvm.org/) 4.0 (Linux 4.x x64)
-- Clang 5.0 (macOS 10.12 x64)
-- Visual Studio 2017 (Windows 10 x64). Note that LLFIO does not currently
-compile with `/permissive-` due a bug in MSVC.
+- Visual Studio 2019 (Windows 10 x64).
 
 Other compilers, architectures and OSs may work, but are not tested regularly.
 You will need a working [Filesystem TS](https://en.cppreference.com/w/cpp/experimental/fs)
-implementation in your STL, and C++ 14. 
+implementation in your STL, and at least C++ 14. 
 
 ## Get a copy of the source
 
@@ -78,7 +76,9 @@ In this situation, define `LLFIO_HEADERS_ONLY=0`, and choose one of `LLFIO_DYN_L
 
 ## Build static libraries from source
 
-You will need [CMake](https://cmake.org/) installed, v3.1 or better. It is important to do an out-of-tree build, because the build will otherwise fail.
+You will need [CMake](https://cmake.org/) installed, v3.3 or better. It is important to do an out-of-tree build, because the build will otherwise fail.
+
+If you want C++ Coroutines support, you will need a C++ Coroutines supporting compiler. It should get automatically discovered and detected, however note that on Linux you currently need a very recent clang combined with a very recent libc++ as no recent GCC implements C++ Coroutines yet. For Debian/Ubuntu, `apt install libc++-dev-9 libc++abi-dev-9` might do it.
 
 To build and test on POSIX (`make`, `ninja` etc):
 
@@ -102,7 +102,7 @@ ctest -C Release -R llfio_sl
 
 ## Build shared libraries from source
 
-You will need [CMake](https://cmake.org/) installed, v3.1 or better. It is important to do an out-of-tree build, because the build will otherwise fail.
+You will need [CMake](https://cmake.org/) installed, v3.3 or better. It is important to do an out-of-tree build, because the build will otherwise fail.
 
 To build and test on POSIX (`make`, `ninja` etc):
 
@@ -126,4 +126,4 @@ ctest -C Release -R llfio_dl
 
 ## Installing libraries from source
 
-Installing the libraries from CMake does not currently work right due to unfinished single header generation. It's a TODO/FIXME item.
+It all works as per standard with cmake, a `make install` with the usual options and environment variables.

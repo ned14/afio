@@ -29,7 +29,7 @@ Distributed under the Boost Software License, Version 1.0.
 static inline void TestBlockingPipeHandle()
 {
   namespace llfio = LLFIO_V2_NAMESPACE;
-  auto reader = std::async([] {  // This immediately blocks in blocking mode
+  auto readerthread = std::async([] {  // This immediately blocks in blocking mode
     llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test").value();
     llfio::byte buffer[64];
     auto read = reader.read(0, {{buffer, 64}}).value();
@@ -42,9 +42,9 @@ static inline void TestBlockingPipeHandle()
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  if(std::future_status::ready == reader.wait_for(std::chrono::seconds(0)))
+  if(std::future_status::ready == readerthread.wait_for(std::chrono::seconds(0)))
   {
-    reader.get();
+    readerthread.get();  // rethrow exception
   }
   llfio::pipe_handle writer;
   begin = std::chrono::steady_clock::now();
@@ -62,7 +62,34 @@ static inline void TestBlockingPipeHandle()
   BOOST_REQUIRE(written == 5);
   writer.barrier().value();
   writer.close().value();
-  reader.get();
+  readerthread.get();
 }
 
-KERNELTEST_TEST_KERNEL(integration, llfio, path_handle, works, "Tests that blocking llfio::pipe_handle works as expected", TestBlockingPipeHandle())
+static inline void TestNonBlockingPipeHandle()
+{
+  namespace llfio = LLFIO_V2_NAMESPACE;
+  llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
+  llfio::byte buffer[64];
+  {
+    auto read = reader.read(0, {{buffer, 64}}, std::chrono::milliseconds(0));
+    BOOST_REQUIRE(read.has_error());
+    BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
+  }
+  {
+    auto read = reader.read(0, {{buffer, 64}}, std::chrono::seconds(1));
+    BOOST_REQUIRE(read.has_error());
+    BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
+  }
+  llfio::pipe_handle writer = llfio::pipe_handle::pipe_open("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
+  auto written = writer.write(0, {{(const llfio::byte *) "hello", 5}}).value();
+  BOOST_REQUIRE(written == 5);
+  writer.barrier().value();
+  writer.close().value();
+  auto read = reader.read(0, {{buffer, 64}}, std::chrono::milliseconds(0));
+  BOOST_REQUIRE(read.value() == 5);
+  BOOST_CHECK(0 == memcmp(buffer, "hello", 5));
+  reader.close().value();
+}
+
+KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, blocking, "Tests that blocking llfio::pipe_handle works as expected", TestBlockingPipeHandle())
+KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, nonblocking, "Tests that nonblocking llfio::pipe_handle works as expected", TestNonBlockingPipeHandle())

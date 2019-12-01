@@ -25,7 +25,7 @@ Distributed under the Boost Software License, Version 1.0.
 #ifndef LLFIO_STORAGE_PROFILE_H
 #define LLFIO_STORAGE_PROFILE_H
 
-#include "io_service.hpp"
+#include "io_handle.hpp"
 
 #if LLFIO_EXPERIMENTAL_STATUS_CODE
 #include "outcome/experimental/status_outcome.hpp"
@@ -73,8 +73,8 @@ namespace storage_profile
   //! Specialise for a different default value for T
   template <class T> constexpr T default_value() { return T{}; }
 
-  template <> constexpr storage_types map_to_storage_type<io_service::extent_type>() { return storage_types::extent_type; }
-  template <> constexpr io_service::extent_type default_value<io_service::extent_type>() { return static_cast<io_service::extent_type>(-1); }
+  template <> constexpr storage_types map_to_storage_type<io_handle::extent_type>() { return storage_types::extent_type; }
+  template <> constexpr io_handle::extent_type default_value<io_handle::extent_type>() { return static_cast<io_handle::extent_type>(-1); }
   template <> constexpr storage_types map_to_storage_type<unsigned int>() { return storage_types::unsigned_int; }
   template <> constexpr unsigned int default_value<unsigned int>() { return static_cast<unsigned int>(-1); }
   //  template<> constexpr storage_types map_to_storage_type<unsigned long long>() { return storage_types::unsigned_long_long; }
@@ -148,7 +148,7 @@ namespace storage_profile
       switch(type)
       {
       case storage_types::extent_type:
-        return f(*reinterpret_cast<const item<io_service::extent_type> *>(static_cast<const item_base *>(this)));
+        return f(*reinterpret_cast<const item<io_handle::extent_type> *>(static_cast<const item_base *>(this)));
       case storage_types::unsigned_int:
         return f(*reinterpret_cast<const item<unsigned int> *>(static_cast<const item_base *>(this)));
       case storage_types::unsigned_long_long:
@@ -309,21 +309,21 @@ namespace storage_profile
     // Storage characteristics
     item<std::string> device_name = {"storage:device:name", &storage::device};             // e.g. WDC WD30EFRX-68EUZN0
     item<unsigned> device_min_io_size = {"storage:device:min_io_size", &storage::device};  // e.g. 4096
-    item<io_service::extent_type> device_size = {"storage:device:size", &storage::device};
+    item<io_handle::extent_type> device_size = {"storage:device:size", &storage::device};
 
     // Filing system characteristics
     item<std::string> fs_name = {"storage:fs:name", &storage::fs};
     item<std::string> fs_config = {"storage:fs:config", &storage::fs};  // POSIX mount options, ZFS pool properties etc
                                                                         //        item<std::string> fs_ffeatures = { "storage:fs:features" };  // Standardised features???
-    item<io_service::extent_type> fs_size = {"storage:fs:size", &storage::fs};
+    item<io_handle::extent_type> fs_size = {"storage:fs:size", &storage::fs};
     item<float> fs_in_use = {"storage:fs:in_use", &storage::fs};
 
     // Test results on this filing system, storage and system
-    item<io_service::extent_type> atomic_rewrite_quantum = {"concurrency:atomic_rewrite_quantum", concurrency::atomic_rewrite_quantum, "The i/o modify quantum guaranteed to be atomically visible to readers irrespective of rewrite quantity"};
-    item<io_service::extent_type> max_aligned_atomic_rewrite = {"concurrency:max_aligned_atomic_rewrite", concurrency::atomic_rewrite_quantum,
+    item<io_handle::extent_type> atomic_rewrite_quantum = {"concurrency:atomic_rewrite_quantum", concurrency::atomic_rewrite_quantum, "The i/o modify quantum guaranteed to be atomically visible to readers irrespective of rewrite quantity"};
+    item<io_handle::extent_type> max_aligned_atomic_rewrite = {"concurrency:max_aligned_atomic_rewrite", concurrency::atomic_rewrite_quantum,
                                                                 "The maximum single aligned i/o modify quantity atomically visible to readers (can be [potentially unreliably] much larger than atomic_rewrite_quantum). "
                                                                 "A very common value on modern hardware with direct i/o thanks to PCIe DMA is 4096, don't trust values higher than this because of potentially discontiguous memory page mapping."};
-    item<io_service::extent_type> atomic_rewrite_offset_boundary = {"concurrency:atomic_rewrite_offset_boundary", concurrency::atomic_rewrite_offset_boundary, "The multiple of offset in a file where update atomicity breaks, so if you wrote 4096 bytes at a 512 offset and "
+    item<io_handle::extent_type> atomic_rewrite_offset_boundary = {"concurrency:atomic_rewrite_offset_boundary", concurrency::atomic_rewrite_offset_boundary, "The multiple of offset in a file where update atomicity breaks, so if you wrote 4096 bytes at a 512 offset and "
                                                                                                                                                                "this value was 4096, your write would tear at 3584 because all writes would tear on a 4096 offset multiple. "
                                                                                                                                                                "Linux has a famously broken kernel i/o design which causes this value to be a page multiple, except on "
                                                                                                                                                                "filing systems which take special measures to work around it. Windows NT appears to lose all atomicity as soon as "

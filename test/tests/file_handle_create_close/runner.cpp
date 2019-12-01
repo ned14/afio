@@ -22,7 +22,6 @@ Distributed under the Boost Software License, Version 1.0.
           http://www.boost.org/LICENSE_1_0.txt)
 */
 
-#include "kernel_async_file_handle.cpp.hpp"
 #include "kernel_file_handle.cpp.hpp"
 
 template <class U> inline void file_handle_create_close_creation(U &&f)
@@ -98,5 +97,3 @@ template <class U> inline void file_handle_create_close_creation(U &&f)
 
 KERNELTEST_TEST_KERNEL(unit, llfio, file_handle_create_close, file_handle, "Tests that llfio::file_handle::file()'s parameters with absolute paths work as expected", file_handle_create_close_creation(file_handle_create_close::test_kernel_file_handle_absolute))
 KERNELTEST_TEST_KERNEL(unit, llfio, file_handle_create_close, file_handle, "Tests that llfio::file_handle::file()'s parameters with relative paths work as expected", file_handle_create_close_creation(file_handle_create_close::test_kernel_file_handle_relative))
-KERNELTEST_TEST_KERNEL(unit, llfio, file_handle_create_close, async_file_handle, "Tests that llfio::async_file_handle::async_file()'s parameters with absolute paths work as expected", file_handle_create_close_creation(file_handle_create_close::test_kernel_async_file_handle_absolute))
-KERNELTEST_TEST_KERNEL(unit, llfio, file_handle_create_close, async_file_handle, "Tests that llfio::async_file_handle::async_file()'s parameters with relative paths work as expected", file_handle_create_close_creation(file_handle_create_close::test_kernel_async_file_handle_relative))
