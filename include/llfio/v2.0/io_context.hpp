@@ -146,35 +146,7 @@ protected:
     write,
     barrier
   };
-  struct _await_io_handle_ready_awaitable;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _await_io_handle_ready(_await_io_handle_ready_awaitable *a, _coroutine_handle<> co) noexcept = 0;
-  struct _await_io_handle_ready_awaitable
-  {
-    io_context *ctx;
-    handle *_h;
-    void *_identifier;  // OVERLAPPED * on Windows, struct aiocb * on BSD, null otherwise
-    _io_kind _kind;
-    deadline _d;
-    optional<result<void>> _ret;
-
-    explicit _await_io_handle_ready_awaitable(io_context *_ctx, handle *h, void *identifier, _io_kind kind, deadline d)
-        : ctx(_ctx)
-        , _h(h)
-        , _identifier(identifier)
-        , _kind(kind)
-        , _d(d)
-    {
-      assert(!_d || !_d.steady || 0 != _d.nsecs);
-    }
-
-    bool await_ready() { return false; }  // always suspend
-    bool await_suspend(_coroutine_handle<> co)
-    {
-      _ret = ctx->_await_io_handle_ready(this, co);
-      return false;  // immediately resume if it returns
-    }
-    result<void> await_resume() { return _ret.value(); }
-  };
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _run_until_ready(handle *h, void *identifier, _io_kind kind, deadline d, _coroutine_handle<> co) noexcept = 0;
 #endif
 
 public:

@@ -304,7 +304,7 @@ public:
   LLFIO_MAKE_FREE_FUNCTION
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> close() noexcept override
   {
-    if(this->_ctx!=nullptr)
+    if(this->_ctx != nullptr)
     {
       OUTCOME_TRY(set_multiplexer(nullptr));
     }
@@ -330,11 +330,10 @@ public:
   */
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC size_t max_buffers() const noexcept;
 
-  /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null, 
+  /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null,
   then this handle has not been registered with an i/o context yet.
   */
-  io_context *multiplexer() const noexcept { 
-    return this->_ctx; }
+  io_context *multiplexer() const noexcept { return this->_ctx; }
 
   /*! \brief Sets the i/o context this handle will use to multiplex i/o.
 
@@ -354,16 +353,16 @@ public:
     {
       return errc::operation_not_supported;
     }
-    if(c==this->_ctx)
+    if(c == this->_ctx)
     {
       return success();
     }
-    if(this->_ctx !=nullptr)
+    if(this->_ctx != nullptr)
     {
       OUTCOME_TRY(this->_ctx->_deregister_io_handle(this));
       this->_ctx = nullptr;
     }
-    if(c!=nullptr)
+    if(c != nullptr)
     {
       OUTCOME_TRY(c->_register_io_handle(this));
     }
@@ -482,10 +481,72 @@ public:
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  /*! \brief An eager awaitable type, where eager means that the operation is attempted immediately,
-  and if it can be completely immediately without blocking then the awaitable is returned ready.
+  using _io_kind = typename io_context::_io_kind;
+  /*! \brief An i/o awaitable type, where the operation is attempted immediately,
+  and if it can be completed immediately without blocking then the awaitable is returned ready.
+  If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
+  If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
+  i/o completes.
   */
-  template<class T> using eager_awaitable = OUTCOME_V2_NAMESPACE::awaitables::eager<T>;
+  template <class T> class io_awaitable
+  {
+    friend class io_handle;
+    using _result_type = decltype(T());
+    io_handle *_h{nullptr};
+    T _f;
+    _io_kind _kind;
+    deadline _d;
+    std::chrono::steady_clock::time_point begin_steady;
+    optional<_result_type> _ret;
+
+    bool _try_op()
+    {
+      assert(!_ret.has_value());
+      // Poll the i/o
+      auto r = _f();
+      if(r || r.error() != errc::timed_out)
+      {
+        // done
+        _ret = std::move(r);
+        return true;
+      }
+      return false;
+    }
+    template <class U>
+    io_awaitable(io_handle *h, U &&v, _io_kind kind, deadline d)
+        : _h(h)
+        , _f(std::forward<U>(v))
+        , _kind(kind)
+        , _d(d)
+    {
+      if(_d && _d.steady)
+      {
+        begin_steady = std::chrono::steady_clock::now();
+      }
+    }
+
+  public:
+    bool await_ready()
+    {
+      _try_op();
+      return _ret.has_value();
+    }
+    bool await_suspend(_coroutine_handle<> co)
+    {
+      do
+      {
+        deadline nd;
+        LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
+        auto r = _h->multiplexer()->_run_until_ready(_h, nullptr, _kind, nd, co);
+        if(!r)
+        {
+          _ret = {r.error()};
+        }
+      } while(!await_ready());
+    }
+    T await_resume() { return _ret.value(); }
+  };
+  template <class T> auto _make_io_awaitable(T &&f, _io_kind kind, deadline d) { return io_awaitable<std::decay_t<T>>(this, std::forward<T>(f), kind, d); }
 
   /*! \brief Read data from the open handle immediately if it would not block, if so
   the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
@@ -500,20 +561,14 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<buffers_type>> co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept;
-  //! Convenience initialiser list based overload for `co_read()`
-  LLFIO_MAKE_FREE_FUNCTION
-  eager_awaitable<io_result<size_type>> co_read(extent_type offset, std::initializer_list<buffer_type> lst, deadline d = deadline()) noexcept
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept
   {
-    buffer_type *_reqs = reinterpret_cast<buffer_type *>(alloca(sizeof(buffer_type) * lst.size()));
-    memcpy(_reqs, lst.begin(), sizeof(buffer_type) * lst.size());
-    io_request<buffers_type> reqs(buffers_type(_reqs, lst.size()), offset);
-    auto ret = co_await co_read(reqs, d);
-    if(ret)
+    LLFIO_LOG_FUNCTION_CALL(this);
+    if(multiplexer() == nullptr)
     {
-      co_return ret.bytes_transferred();
+      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
     }
-    co_return std::move(ret).error();
+    return _make_io_awaitable([this, reqs] { return read(reqs, std::chrono::seconds(0)); }, _io_kind::read, d);
   }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_read)
@@ -531,20 +586,14 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<const_buffers_type>> co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept;
-  //! Convenience initialiser list based overload for `co_read()`
-  LLFIO_MAKE_FREE_FUNCTION
-  eager_awaitable<io_result<size_type>> co_write(extent_type offset, std::initializer_list<const_buffer_type> lst, deadline d = deadline()) noexcept
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept
   {
-    const_buffer_type *_reqs = reinterpret_cast<const_buffer_type *>(alloca(sizeof(const_buffer_type) * lst.size()));
-    memcpy(_reqs, lst.begin(), sizeof(const_buffer_type) * lst.size());
-    io_request<const_buffers_type> reqs(const_buffers_type(_reqs, lst.size()), offset);
-    auto ret = co_await co_write(reqs, d);
-    if(ret)
+    LLFIO_LOG_FUNCTION_CALL(this);
+    if(multiplexer() == nullptr)
     {
-      co_return ret.bytes_transferred();
+      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
     }
-    co_return std::move(ret).error();
+    return _make_io_awaitable([this, reqs] { return write(reqs, std::chrono::seconds(0)); }, _io_kind::write, d);
   }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_write)
@@ -562,7 +611,15 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC eager_awaitable<io_result<const_buffers_type>> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept
+  {
+    LLFIO_LOG_FUNCTION_CALL(this);
+    if(multiplexer() == nullptr)
+    {
+      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
+    }
+    return _make_io_awaitable([this, reqs, kind] { return barrier(reqs, kind, std::chrono::seconds(0)); }, _io_kind::barrier, d);
+  }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
 #endif

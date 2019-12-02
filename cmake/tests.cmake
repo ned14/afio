@@ -3,7 +3,6 @@ set(llfio_TESTS
   "test/test_kernel_decl.hpp"
   "test/tests/directory_handle_create_close/kernel_directory_handle.cpp.hpp"
   "test/tests/directory_handle_enumerate/kernel_directory_handle_enumerate.cpp.hpp"
-  "test/tests/file_handle_create_close/kernel_async_file_handle.cpp.hpp"
   "test/tests/file_handle_create_close/kernel_file_handle.cpp.hpp"
   "test/tests/map_handle_create_close/kernel_map_handle.cpp.hpp"
   "test/tests/section_handle_create_close/kernel_section_handle.cpp.hpp"

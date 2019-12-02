@@ -239,12 +239,12 @@ public:
         if(!_durations.empty())
         {
           deadline_duration = _durations.begin()->first;
-          auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline_duration).count();
+          auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_duration - std::chrono::steady_clock::now()).count();
           if(togo <= 0)
           {
             resume_timed_out = _durations.begin()->second;
           }
-          else if(togo < mstimeout)
+          else if(-1 == mstimeout || togo < mstimeout)
           {
             mstimeout = togo;
           }
@@ -252,12 +252,12 @@ public:
         if(!_absolutes.empty())
         {
           deadline_absolute = _absolutes.begin()->first;
-          auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - deadline_absolute).count();
+          auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_absolute - std::chrono::system_clock::now()).count();
           if(togo <= 0)
           {
             resume_timed_out = _absolutes.begin()->second;
           }
-          else if(togo < mstimeout)
+          else if(-1 == mstimeout || togo < mstimeout)
           {
             mstimeout = togo;
           }
@@ -277,7 +277,6 @@ public:
               _remove_io(resume_timed_out, i);
               g.unlock();
               co.resume();
-              // Probably never returns
               return true;
             }
           }
@@ -317,7 +316,6 @@ public:
             _remove_io(it, i);
             g.unlock();
             co.resume();
-            // Probably never returns
             g.lock();
             continue;
           }
@@ -327,7 +325,6 @@ public:
             _remove_io(it, i);
             g.unlock();
             co.resume();
-            // Probably never returns
             return true;
           }
           if(i.kind == _io_kind::write && (ev.events & EPOLLOUT) != 0)
@@ -336,7 +333,6 @@ public:
             _remove_io(it, i);
             g.unlock();
             co.resume();
-            // Probably never returns
             return true;
           }
         }
@@ -347,70 +343,58 @@ public:
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
   virtual result<void> _await_io_handle_ready(typename _base::_await_io_handle_ready_awaitable *aw, _coroutine_handle<> co) noexcept override final
   {
-    LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(aw->_d);
-    // Set this coroutine to be resumed when the i/o completes
-    bool nospace = true;
-    _lock_guard g(this->_lock);
-    auto it = _registered_handles.find(aw->_h->native_handle().fd);
-    if(it == _registered_handles.end())
+    try
     {
-      abort();
-    }
-    for(auto &i : it->second.io_outstanding)
-    {
-      if(i.kind == _io_kind::unknown)
+      LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(aw->_d);
+      // Set this coroutine to be resumed when the i/o completes
+      bool nospace = true;
+      _lock_guard g(this->_lock);
+      auto it = _registered_handles.find(aw->_h->native_handle().fd);
+      if(it == _registered_handles.end())
       {
-        i.kind = aw->_kind;
-        if(aw->_d)
+        abort();
+      }
+      for(auto &i : it->second.io_outstanding)
+      {
+        if(i.kind == _io_kind::unknown)
         {
-          if(aw->_d.steady)
+          i.kind = aw->_kind;
+          if(aw->_d)
           {
-            i.deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(aw->_d.nsecs);
-            i.deadline_absolute = {};
-            _durations.insert({i.deadline_duration, it});
+            if(aw->_d.steady)
+            {
+              i.deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(aw->_d.nsecs);
+              i.deadline_absolute = {};
+              _durations.insert({i.deadline_duration, it});
+            }
+            else
+            {
+              i.deadline_duration = {};
+              i.deadline_absolute = aw->_d.to_time_point();
+              _absolutes.insert({i.deadline_absolute, it});
+            }
           }
           else
           {
             i.deadline_duration = {};
-            i.deadline_absolute = aw->_d.to_time_point();
-            _absolutes.insert({i.deadline_absolute, it});
+            i.deadline_absolute = {};
           }
+          i.co = co;
+          nospace = false;
+          break;
         }
-        else
-        {
-          i.deadline_duration = {};
-          i.deadline_absolute = {};
-        }
-        i.co = co;
-        nospace = false;
-        break;
       }
-    }
-    if(nospace)
-    {
-      return errc::resource_unavailable_try_again;  // not enough i/o slots
-    }
-    // This i/o is registered, pump completions until my coroutine resumes.
-    // He will resume my coroutine if its deadline expires.
-    for(;;)
-    {
-      g.unlock();
-      auto r = run();  // to infinity, though it may return
-      if(!r)
+      if(nospace)
       {
-        g.lock();
-        for(auto &i : it->second.io_outstanding)
-        {
-          if(i.co == co)
-          {
-            _remove_io(it, i);
-            break;
-          }
-        }
-        return r.error();
+        return errc::resource_unavailable_try_again;  // not enough i/o slots
       }
+      // This i/o is registered for later resumption!
+      return success();
     }
-    return success();
+    catch(...)
+    {
+      return error_from_exception();
+    }
   }
 #endif
 };
