@@ -49,6 +49,12 @@ public:
   using creation = handle::creation;
   using caching = handle::caching;
   using flag = handle::flag;
+  using buffer_type = io_context::buffer_type;
+  using const_buffer_type = io_context::const_buffer_type;
+  using buffers_type = io_context::buffers_type;
+  using const_buffers_type = io_context::const_buffers_type;
+  template <class T> using io_request = io_context::io_request<T>;
+  template <class T> using io_result = io_context::io_result<T>;
 
   //! The kinds of write reordering barrier which can be performed.
   enum class barrier_kind
@@ -58,225 +64,6 @@ public:
     nowait_all,        //!< Barrier data and the metadata to retrieve it, non-blocking.
     wait_all           //!< Barrier data and the metadata to retrieve it, block until it is done.
   };
-
-  //! The scatter buffer type used by this handle. Guaranteed to be `TrivialType` and `StandardLayoutType`.
-  //! Try to make address and length 64 byte, or ideally, `page_size()` aligned where possible.
-  struct buffer_type
-  {
-    //! Type of the pointer to memory.
-    using pointer = byte *;
-    //! Type of the pointer to memory.
-    using const_pointer = const byte *;
-    //! Type of the iterator to memory.
-    using iterator = byte *;
-    //! Type of the iterator to memory.
-    using const_iterator = const byte *;
-    //! Type of the length of memory.
-    using size_type = size_t;
-
-    //! Default constructor
-    buffer_type() = default;
-    //! Constructor
-    constexpr buffer_type(pointer data, size_type len) noexcept
-        : _data(data)
-        , _len(len)
-    {
-    }
-    buffer_type(const buffer_type &) = default;
-    buffer_type(buffer_type &&) = default;
-    buffer_type &operator=(const buffer_type &) = default;
-    buffer_type &operator=(buffer_type &&) = default;
-    ~buffer_type() = default;
-
-    // Emulation of this being a span<byte> in the TS
-
-    //! Returns the address of the bytes for this buffer
-    constexpr pointer data() noexcept { return _data; }
-    //! Returns the address of the bytes for this buffer
-    constexpr const_pointer data() const noexcept { return _data; }
-    //! Returns the number of bytes in this buffer
-    constexpr size_type size() const noexcept { return _len; }
-
-    //! Returns an iterator to the beginning of the buffer
-    constexpr iterator begin() noexcept { return _data; }
-    //! Returns an iterator to the beginning of the buffer
-    constexpr const_iterator begin() const noexcept { return _data; }
-    //! Returns an iterator to the beginning of the buffer
-    constexpr const_iterator cbegin() const noexcept { return _data; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr iterator end() noexcept { return _data + _len; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr const_iterator end() const noexcept { return _data + _len; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr const_iterator cend() const noexcept { return _data + _len; }
-
-  private:
-    friend constexpr inline void _check_iovec_match();
-    pointer _data;
-    size_type _len;
-  };
-  //! The gather buffer type used by this handle. Guaranteed to be `TrivialType` and `StandardLayoutType`.
-  //! Try to make address and length 64 byte, or ideally, `page_size()` aligned where possible.
-  struct const_buffer_type
-  {
-    //! Type of the pointer to memory.
-    using pointer = const byte *;
-    //! Type of the pointer to memory.
-    using const_pointer = const byte *;
-    //! Type of the iterator to memory.
-    using iterator = const byte *;
-    //! Type of the iterator to memory.
-    using const_iterator = const byte *;
-    //! Type of the length of memory.
-    using size_type = size_t;
-
-    //! Default constructor
-    const_buffer_type() = default;
-    //! Constructor
-    constexpr const_buffer_type(pointer data, size_type len) noexcept
-        : _data(data)
-        , _len(len)
-    {
-    }
-    //! Converting constructor from non-const buffer type
-    constexpr const_buffer_type(buffer_type b) noexcept
-        : _data(b.data())
-        , _len(b.size())
-    {
-    }
-    const_buffer_type(const const_buffer_type &) = default;
-    const_buffer_type(const_buffer_type &&) = default;
-    const_buffer_type &operator=(const const_buffer_type &) = default;
-    const_buffer_type &operator=(const_buffer_type &&) = default;
-    ~const_buffer_type() = default;
-
-    // Emulation of this being a span<byte> in the TS
-
-    //! Returns the address of the bytes for this buffer
-    constexpr pointer data() noexcept { return _data; }
-    //! Returns the address of the bytes for this buffer
-    constexpr const_pointer data() const noexcept { return _data; }
-    //! Returns the number of bytes in this buffer
-    constexpr size_type size() const noexcept { return _len; }
-
-    //! Returns an iterator to the beginning of the buffer
-    constexpr iterator begin() noexcept { return _data; }
-    //! Returns an iterator to the beginning of the buffer
-    constexpr const_iterator begin() const noexcept { return _data; }
-    //! Returns an iterator to the beginning of the buffer
-    constexpr const_iterator cbegin() const noexcept { return _data; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr iterator end() noexcept { return _data + _len; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr const_iterator end() const noexcept { return _data + _len; }
-    //! Returns an iterator to after the end of the buffer
-    constexpr const_iterator cend() const noexcept { return _data + _len; }
-
-  private:
-    pointer _data;
-    size_type _len;
-  };
-#ifndef NDEBUG
-  static_assert(std::is_trivial<buffer_type>::value, "buffer_type is not a trivial type!");
-  static_assert(std::is_trivial<const_buffer_type>::value, "const_buffer_type is not a trivial type!");
-  static_assert(std::is_standard_layout<buffer_type>::value, "buffer_type is not a standard layout type!");
-  static_assert(std::is_standard_layout<const_buffer_type>::value, "const_buffer_type is not a standard layout type!");
-#endif
-  //! The scatter buffers type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
-  using buffers_type = span<buffer_type>;
-  //! The gather buffers type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
-  using const_buffers_type = span<const_buffer_type>;
-#ifndef NDEBUG
-  // Is trivial in all ways, except default constructibility
-  static_assert(std::is_trivially_copyable<buffers_type>::value, "buffers_type is not trivially copyable!");
-  // static_assert(std::is_trivially_assignable<buffers_type, buffers_type>::value, "buffers_type is not trivially assignable!");
-  // static_assert(std::is_trivially_destructible<buffers_type>::value, "buffers_type is not trivially destructible!");
-  // static_assert(std::is_trivially_copy_constructible<buffers_type>::value, "buffers_type is not trivially copy constructible!");
-  // static_assert(std::is_trivially_move_constructible<buffers_type>::value, "buffers_type is not trivially move constructible!");
-  // static_assert(std::is_trivially_copy_assignable<buffers_type>::value, "buffers_type is not trivially copy assignable!");
-  // static_assert(std::is_trivially_move_assignable<buffers_type>::value, "buffers_type is not trivially move assignable!");
-  static_assert(std::is_standard_layout<buffers_type>::value, "buffers_type is not a standard layout type!");
-#endif
-  //! The i/o request type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
-  template <class T> struct io_request
-  {
-    T buffers{};
-    extent_type offset{0};
-    constexpr io_request() {}  // NOLINT (defaulting this breaks clang and GCC, so don't do it!)
-    constexpr io_request(T _buffers, extent_type _offset)
-        : buffers(std::move(_buffers))
-        , offset(_offset)
-    {
-    }
-  };
-#ifndef NDEBUG
-  // Is trivial in all ways, except default constructibility
-  static_assert(std::is_trivially_copyable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copyable!");
-  // static_assert(std::is_trivially_assignable<io_request<buffers_type>, io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially assignable!");
-  // static_assert(std::is_trivially_destructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially destructible!");
-  // static_assert(std::is_trivially_copy_constructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copy constructible!");
-  // static_assert(std::is_trivially_move_constructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially move constructible!");
-  // static_assert(std::is_trivially_copy_assignable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copy assignable!");
-  // static_assert(std::is_trivially_move_assignable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially move assignable!");
-  static_assert(std::is_standard_layout<io_request<buffers_type>>::value, "io_request<buffers_type> is not a standard layout type!");
-#endif
-  //! The i/o result type used by this handle. Guaranteed to be `TrivialType` apart from construction.
-  template <class T> struct io_result : public LLFIO_V2_NAMESPACE::result<T>
-  {
-    using Base = LLFIO_V2_NAMESPACE::result<T>;
-    size_type _bytes_transferred{static_cast<size_type>(-1)};
-
-#if defined(_MSC_VER) && !defined(__clang__)  // workaround MSVC parsing bug
-    constexpr io_result()
-        : Base()
-    {
-    }
-    template <class... Args>
-    constexpr io_result(Args &&... args)
-        : Base(std::forward<Args>(args)...)
-    {
-    }
-#else
-    using Base::Base;
-    io_result() = default;
-#endif
-    ~io_result() = default;
-    io_result &operator=(io_result &&) = default;  // NOLINT
-#if LLFIO_EXPERIMENTAL_STATUS_CODE
-    io_result(const io_result &) = delete;
-    io_result &operator=(const io_result &) = delete;
-#else
-    io_result(const io_result &) = default;
-    io_result &operator=(const io_result &) = default;
-#endif
-    io_result(io_result &&) = default;  // NOLINT
-    //! Returns bytes transferred
-    size_type bytes_transferred() noexcept
-    {
-      if(_bytes_transferred == static_cast<size_type>(-1))
-      {
-        _bytes_transferred = 0;
-        for(auto &i : this->value())
-        {
-          _bytes_transferred += i.size();
-        }
-      }
-      return _bytes_transferred;
-    }
-  };
-#if !defined(NDEBUG) && !LLFIO_EXPERIMENTAL_STATUS_CODE
-  // Is trivial in all ways, except default constructibility
-  static_assert(std::is_trivially_copyable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copyable!");
-// static_assert(std::is_trivially_assignable<io_result<buffers_type>, io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially assignable!");
-// static_assert(std::is_trivially_destructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially destructible!");
-// static_assert(std::is_trivially_copy_constructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copy constructible!");
-// static_assert(std::is_trivially_move_constructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially move constructible!");
-// static_assert(std::is_trivially_copy_assignable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copy assignable!");
-// static_assert(std::is_trivially_move_assignable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially move assignable!");
-//! \todo Why is io_result<buffers_type> not a standard layout type?
-// static_assert(std::is_standard_layout<result<buffers_type>>::value, "result<buffers_type> is not a standard layout type!");
-// static_assert(std::is_standard_layout<io_result<buffers_type>>::value, "io_result<buffers_type> is not a standard layout type!");
-#endif
 
 public:
   //! Default constructor
@@ -481,72 +268,12 @@ public:
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  using _io_kind = typename io_context::_io_kind;
-  /*! \brief An i/o awaitable type, where the operation is attempted immediately,
-  and if it can be completed immediately without blocking then the awaitable is returned ready.
-  If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
-  If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
-  i/o completes.
-  */
-  template <class T> class io_awaitable
-  {
-    friend class io_handle;
-    using _result_type = decltype(T());
-    io_handle *_h{nullptr};
-    T _f;
-    _io_kind _kind;
-    deadline _d;
-    std::chrono::steady_clock::time_point begin_steady;
-    optional<_result_type> _ret;
-
-    bool _try_op()
-    {
-      assert(!_ret.has_value());
-      // Poll the i/o
-      auto r = _f();
-      if(r || r.error() != errc::timed_out)
-      {
-        // done
-        _ret = std::move(r);
-        return true;
-      }
-      return false;
-    }
-    template <class U>
-    io_awaitable(io_handle *h, U &&v, _io_kind kind, deadline d)
-        : _h(h)
-        , _f(std::forward<U>(v))
-        , _kind(kind)
-        , _d(d)
-    {
-      if(_d && _d.steady)
-      {
-        begin_steady = std::chrono::steady_clock::now();
-      }
-    }
-
-  public:
-    bool await_ready()
-    {
-      _try_op();
-      return _ret.has_value();
-    }
-    bool await_suspend(_coroutine_handle<> co)
-    {
-      do
-      {
-        deadline nd;
-        LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
-        auto r = _h->multiplexer()->_run_until_ready(_h, nullptr, _kind, nd, co);
-        if(!r)
-        {
-          _ret = {r.error()};
-        }
-      } while(!await_ready());
-    }
-    T await_resume() { return _ret.value(); }
-  };
-  template <class T> auto _make_io_awaitable(T &&f, _io_kind kind, deadline d) { return io_awaitable<std::decay_t<T>>(this, std::forward<T>(f), kind, d); }
+  //! \brief The type for a read i/o awaitable
+  template <bool use_atomic> using co_read_awaitable = typename io_context::template _co_read_awaitable<use_atomic>;
+  //! \brief The type for a write i/o awaitable
+  template <bool use_atomic> using co_write_awaitable =typename io_context::template _co_write_awaitable<use_atomic>;
+  //! \brief The type for a barrier i/o awaitable
+  template <bool use_atomic> using co_barrier_awaitable = typename io_context::template _co_barrier_awaitable<use_atomic>;
 
   /*! \brief Read data from the open handle immediately if it would not block, if so
   the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
@@ -561,15 +288,7 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept
-  {
-    LLFIO_LOG_FUNCTION_CALL(this);
-    if(multiplexer() == nullptr)
-    {
-      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
-    }
-    return _make_io_awaitable([this, reqs] { return read(reqs, std::chrono::seconds(0)); }, _io_kind::read, d);
-  }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_read_awaitable<false> co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_read)
 
@@ -586,15 +305,7 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept
-  {
-    LLFIO_LOG_FUNCTION_CALL(this);
-    if(multiplexer() == nullptr)
-    {
-      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
-    }
-    return _make_io_awaitable([this, reqs] { return write(reqs, std::chrono::seconds(0)); }, _io_kind::write, d);
-  }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_write_awaitable<false> co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_write)
 
@@ -611,15 +322,7 @@ public:
   that, call `.set_multiplexer()` manually from cold code.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC auto co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept
-  {
-    LLFIO_LOG_FUNCTION_CALL(this);
-    if(multiplexer() == nullptr)
-    {
-      OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
-    }
-    return _make_io_awaitable([this, reqs, kind] { return barrier(reqs, kind, std::chrono::seconds(0)); }, _io_kind::barrier, d);
-  }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_barrier_awaitable<false> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
 #endif

@@ -327,16 +327,16 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
 }
 
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-io_handle::eager_awaitable<io_handle::io_result<io_handle::buffers_type>> io_handle::co_read(io_request<buffers_type> reqs, deadline d) noexcept
+io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   if(multiplexer() == nullptr)
   {
-    OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
+    OUTCOME_TRY(set_multiplexer());  // traps if handle is not multiplexable
   }
   if(reqs.buffers.size() > IOV_MAX)
   {
-    co_return errc::argument_list_too_long;
+    return errc::argument_list_too_long;
   }
   LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
 #if 0
@@ -363,7 +363,7 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::buffers_type>> io_han
   ssize_t bytesread = 0;
   if(is_seekable())
   {
-    co_return errc::operation_not_supported;
+    return errc::operation_not_supported;
   }
   else
   {
@@ -374,17 +374,16 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::buffers_type>> io_han
       {
         if(bytesread < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
         {
-          co_return posix_error();
+          return posix_error();
         }
         // Don't attempt suspension if this is a poll
         if(!d || !d.steady || d.nsecs != 0)
         {
-          // Have my i/o context suspend me until either some data for read turns up, or my deadline expires
-          deadline nd;
-          LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
-          OUTCOME_CO_TRY(co_await io_context::_await_io_handle_ready_awaitable(multiplexer(), this, nullptr, io_context::_io_kind::read, nd));
+          // Have my i/o context suspend my caller until either some data for read turns up, or my deadline expires
+          io_handle::co_read_awaitable<false>::promise_type p(this, reqs, d);
+          return multiplexer()->_run_until_read_ready(std::move(p));
         }
-        LLFIO_POSIX_CO_DEADLINE_TO_TIMEOUT_LOOP(d);
+        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
     } while(bytesread <= 0);
   }
@@ -402,18 +401,19 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::buffers_type>> io_han
       break;
     }
   }
-  co_return{reqs.buffers};
+  return{reqs.buffers};
 }
-io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> io_handle::co_write(io_request<const_buffers_type> reqs, deadline d) noexcept
+
+io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   if(multiplexer() == nullptr)
   {
-    OUTCOME_CO_TRY(set_multiplexer());  // traps if handle is not multiplexable
+    OUTCOME_TRY(set_multiplexer());  // traps if handle is not multiplexable
   }
   if(reqs.buffers.size() > IOV_MAX)
   {
-    co_return errc::argument_list_too_long;
+    return errc::argument_list_too_long;
   }
   LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
 #if 0
@@ -440,7 +440,7 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> 
   ssize_t byteswritten = 0;
   if(is_seekable())
   {
-    co_return errc::operation_not_supported;
+    return errc::operation_not_supported;
   }
   else
   {
@@ -456,17 +456,16 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> 
       {
         if(byteswritten < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
         {
-          co_return posix_error();
+          return posix_error();
         }
         // Don't attempt suspension if this is a poll
         if(!d || !d.steady || d.nsecs != 0)
         {
-          // Have my i/o context suspend me until either some space for write turns up, or my deadline expires
-          deadline nd;
-          LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
-          OUTCOME_CO_TRY(co_await io_context::_await_io_handle_ready_awaitable(multiplexer(), this, nullptr, io_context::_io_kind::write, nd));
+          // Have my i/o context suspend my caller until either some space for write turns up, or my deadline expires
+          io_handle::co_write_awaitable<false>::promise_type p(this, reqs, d);
+          return multiplexer()->_run_until_write_ready(std::move(p));
         }
-        LLFIO_POSIX_CO_DEADLINE_TO_TIMEOUT_LOOP(d);
+        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
     } while(byteswritten <= 0);
   }
@@ -484,9 +483,10 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> 
       break;
     }
   }
-  co_return{reqs.buffers};
+  return{reqs.buffers};
 }
-io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> io_handle::co_barrier(io_request<const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
+
+io_handle::co_barrier_awaitable<false> io_handle::co_barrier(io_request<const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
 {
   (void) reqs;
   (void) kind;
@@ -494,9 +494,9 @@ io_handle::eager_awaitable<io_handle::io_result<io_handle::const_buffers_type>> 
   LLFIO_LOG_FUNCTION_CALL(this);
   if(is_pipe() || is_socket())
   {
-    co_return success();  // nothing was flushed
+    return success();  // nothing was flushed
   }
-  co_return errc::operation_not_supported;
+  return errc::operation_not_supported;
 }
 #endif
 

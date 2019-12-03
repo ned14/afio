@@ -38,6 +38,198 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
 class io_handle;
 
+#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+template <class Promise = void> using coroutine_handle = OUTCOME_V2_NAMESPACE::awaitables::coroutine_handle<Promise>;
+template <class... Args> using coroutine_traits = OUTCOME_V2_NAMESPACE::awaitables::coroutine_traits<Args...>;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_always;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_never;
+
+//! \brief The promise type for an i/o awaitable
+template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
+{
+  using container_type = io_result<typename Awaitable::container_type>;
+  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
+  union {
+    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
+    container_type result;
+  };
+  result_set_type result_set{false};
+  coroutine_handle<> continuation;
+  handle *h{nullptr};
+  io_request<typename Awaitable::container_type> reqs{};
+  deadline d{};
+
+  // Constructor used by coroutines
+  io_awaitable_promise_type() {}
+  // Constructor used by co_read|co_write|co_barrier
+  io_awaitable_promise_type(handle *_h, io_request<typename Awaitable::container_type> _reqs, deadline _d)
+      : h(_h)
+      , reqs(_reqs)
+      , d(_d)
+  {
+  }
+  io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
+  io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
+      : result_set(o.result_set.load())
+      , continuation(o.continuation)
+  {
+    if(result_set.load(std::memory_order_acquire))
+    {
+      new(&result) container_type(static_cast<container_type &&>(o.result));
+    }
+    o.continuation = {};
+  }
+  io_awaitable_promise_type &operator=(const io_awaitable_promise_type &) = delete;
+  io_awaitable_promise_type &operator=(io_awaitable_promise_type &&) = delete;
+  ~io_awaitable_promise_type()
+  {
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+  }
+  auto get_return_object() { return Awaitable{*this}; }
+  void return_value(container_type &&value)
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+    new(&result) container_type(static_cast<container_type &&>(value));
+    result_set.store(true, std::memory_order_release);
+  }
+  void return_value(const container_type &value)
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+    new(&result) container_type(value);
+    result_set.store(true, std::memory_order_release);
+  }
+  void unhandled_exception()
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+#ifdef __cpp_exceptions
+    auto e = std::current_exception();
+    auto ec = detail::error_from_exception(static_cast<decltype(e) &&>(e), {});
+    // Try to set error code first
+    if(!detail::error_is_set(ec) || !detail::try_set_error(ec, &result))
+    {
+      detail::set_or_rethrow(e, &result);
+    }
+#else
+    std::terminate();
+#endif
+    result_set.store(true, std::memory_order_release);
+  }
+  auto initial_suspend() noexcept
+  {
+    struct awaiter
+    {
+      bool await_ready() noexcept { return true; }
+      void await_resume() noexcept {}
+      void await_suspend(coroutine_handle<> /*unused*/) {}
+    };
+    return awaiter{};
+  }
+  auto final_suspend()
+  {
+    struct awaiter
+    {
+      bool await_ready() noexcept { return false; }
+      void await_resume() noexcept {}
+      void await_suspend(coroutine_handle<io_awaitable_promise_type> self)
+      {
+        if(self.promise().continuation)
+        {
+          return self.promise().continuation.resume();
+        }
+      }
+    };
+    return awaiter{};
+  }
+};
+
+/*! \brief An i/o awaitable type, where the operation is attempted immediately,
+and if it can be completed immediately without blocking then the awaitable is returned ready.
+If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
+If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
+i/o completes.
+*/
+template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable
+{
+  using container_type = Cont;
+  using promise_type = outcome_promise_type<io_awaitable, use_atomic>;
+  union {
+    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
+    io_result<container_type> _immediate_result;
+  };
+  coroutine_handle<promise_type> _h;
+
+public:
+  io_awaitable(io_awaitable &&o) noexcept
+      : _h(static_cast<coroutine_handle<promise_type> &&>(o._h))
+  {
+    o._h = nullptr;
+    if(!_h)
+    {
+      new(&_immediate_result) container_type(static_cast<io_result<container_type> &&>(o._immediate_result));
+    }
+  }
+  io_awaitable(const io_awaitable &o) = delete;
+  io_awaitable &operator=(io_awaitable &&) = delete;  // as per P1056
+  io_awaitable &operator=(const io_awaitable &) = delete;
+  ~io_awaitable()
+  {
+    if(_h)
+    {
+      _h.destroy();
+    }
+    else
+    {
+      _immediate_result.~io_result<container_type>();
+    }
+  }
+
+  // Construct an awaitable set later by its promise
+  explicit io_awaitable(promise_type &p)
+      : _h(coroutine_handle<promise_type>::from_promise(p))
+  {
+  }
+  // Construct an awaitable which has an immediate result
+  io_awaitable(io_result<container_type> &&c)
+      : _immediate_result(static_cast<io_result<container_type> &&>(c))
+  {
+  }
+  bool await_ready() noexcept { return !_h || _h.promise().result_set.load(std::memory_order_acquire); }
+  io_result<container_type> await_resume()
+  {
+    if(!_h)
+    {
+      return static_cast<typename io_result<container_type> &&>(_immediate_result);
+    }
+    assert(_h.promise().result_set.load(std::memory_order_acquire));
+    if(!_h.promise().result_set.load(std::memory_order_acquire))
+    {
+      std::terminate();
+    }
+    return static_cast<typename io_result<container_type> &&>(_h.promise().result);
+  }
+  void await_suspend(coroutine_handle<> cont)
+  {
+    _h.promise().continuation = cont;
+    _h.resume();
+  }
+};
+#endif
+
 /*! \class io_context
 \brief An i/o multiplexer context.
 
@@ -137,19 +329,235 @@ protected:
 
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _register_io_handle(handle *h) noexcept = 0;
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _deregister_io_handle(handle *h) noexcept = 0;
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  template <class Promise = void> using _coroutine_handle = OUTCOME_V2_NAMESPACE::awaitables::coroutine_handle<Promise>;
-  enum class _io_kind
-  {
-    unknown,
-    read,
-    write,
-    barrier
-  };
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _run_until_ready(handle *h, void *identifier, _io_kind kind, deadline d, _coroutine_handle<> co) noexcept = 0;
-#endif
 
 public:
+  using path_type = handle::path_type;
+  using extent_type = handle::extent_type;
+  using size_type = handle::size_type;
+  using mode = handle::mode;
+  using creation = handle::creation;
+  using caching = handle::caching;
+  using flag = handle::flag;
+
+  //! The scatter buffer type used by this handle. Guaranteed to be `TrivialType` and `StandardLayoutType`.
+  //! Try to make address and length 64 byte, or ideally, `page_size()` aligned where possible.
+  struct buffer_type
+  {
+    //! Type of the pointer to memory.
+    using pointer = byte *;
+    //! Type of the pointer to memory.
+    using const_pointer = const byte *;
+    //! Type of the iterator to memory.
+    using iterator = byte *;
+    //! Type of the iterator to memory.
+    using const_iterator = const byte *;
+    //! Type of the length of memory.
+    using size_type = size_t;
+
+    //! Default constructor
+    buffer_type() = default;
+    //! Constructor
+    constexpr buffer_type(pointer data, size_type len) noexcept
+        : _data(data)
+        , _len(len)
+    {
+    }
+    buffer_type(const buffer_type &) = default;
+    buffer_type(buffer_type &&) = default;
+    buffer_type &operator=(const buffer_type &) = default;
+    buffer_type &operator=(buffer_type &&) = default;
+    ~buffer_type() = default;
+
+    // Emulation of this being a span<byte> in the TS
+
+    //! Returns the address of the bytes for this buffer
+    constexpr pointer data() noexcept { return _data; }
+    //! Returns the address of the bytes for this buffer
+    constexpr const_pointer data() const noexcept { return _data; }
+    //! Returns the number of bytes in this buffer
+    constexpr size_type size() const noexcept { return _len; }
+
+    //! Returns an iterator to the beginning of the buffer
+    constexpr iterator begin() noexcept { return _data; }
+    //! Returns an iterator to the beginning of the buffer
+    constexpr const_iterator begin() const noexcept { return _data; }
+    //! Returns an iterator to the beginning of the buffer
+    constexpr const_iterator cbegin() const noexcept { return _data; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr iterator end() noexcept { return _data + _len; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr const_iterator end() const noexcept { return _data + _len; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr const_iterator cend() const noexcept { return _data + _len; }
+
+  private:
+    friend constexpr inline void _check_iovec_match();
+    pointer _data;
+    size_type _len;
+  };
+  //! The gather buffer type used by this handle. Guaranteed to be `TrivialType` and `StandardLayoutType`.
+  //! Try to make address and length 64 byte, or ideally, `page_size()` aligned where possible.
+  struct const_buffer_type
+  {
+    //! Type of the pointer to memory.
+    using pointer = const byte *;
+    //! Type of the pointer to memory.
+    using const_pointer = const byte *;
+    //! Type of the iterator to memory.
+    using iterator = const byte *;
+    //! Type of the iterator to memory.
+    using const_iterator = const byte *;
+    //! Type of the length of memory.
+    using size_type = size_t;
+
+    //! Default constructor
+    const_buffer_type() = default;
+    //! Constructor
+    constexpr const_buffer_type(pointer data, size_type len) noexcept
+        : _data(data)
+        , _len(len)
+    {
+    }
+    //! Converting constructor from non-const buffer type
+    constexpr const_buffer_type(buffer_type b) noexcept
+        : _data(b.data())
+        , _len(b.size())
+    {
+    }
+    const_buffer_type(const const_buffer_type &) = default;
+    const_buffer_type(const_buffer_type &&) = default;
+    const_buffer_type &operator=(const const_buffer_type &) = default;
+    const_buffer_type &operator=(const_buffer_type &&) = default;
+    ~const_buffer_type() = default;
+
+    // Emulation of this being a span<byte> in the TS
+
+    //! Returns the address of the bytes for this buffer
+    constexpr pointer data() noexcept { return _data; }
+    //! Returns the address of the bytes for this buffer
+    constexpr const_pointer data() const noexcept { return _data; }
+    //! Returns the number of bytes in this buffer
+    constexpr size_type size() const noexcept { return _len; }
+
+    //! Returns an iterator to the beginning of the buffer
+    constexpr iterator begin() noexcept { return _data; }
+    //! Returns an iterator to the beginning of the buffer
+    constexpr const_iterator begin() const noexcept { return _data; }
+    //! Returns an iterator to the beginning of the buffer
+    constexpr const_iterator cbegin() const noexcept { return _data; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr iterator end() noexcept { return _data + _len; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr const_iterator end() const noexcept { return _data + _len; }
+    //! Returns an iterator to after the end of the buffer
+    constexpr const_iterator cend() const noexcept { return _data + _len; }
+
+  private:
+    pointer _data;
+    size_type _len;
+  };
+#ifndef NDEBUG
+  static_assert(std::is_trivial<buffer_type>::value, "buffer_type is not a trivial type!");
+  static_assert(std::is_trivial<const_buffer_type>::value, "const_buffer_type is not a trivial type!");
+  static_assert(std::is_standard_layout<buffer_type>::value, "buffer_type is not a standard layout type!");
+  static_assert(std::is_standard_layout<const_buffer_type>::value, "const_buffer_type is not a standard layout type!");
+#endif
+  //! The scatter buffers type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
+  using buffers_type = span<buffer_type>;
+  //! The gather buffers type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
+  using const_buffers_type = span<const_buffer_type>;
+#ifndef NDEBUG
+  // Is trivial in all ways, except default constructibility
+  static_assert(std::is_trivially_copyable<buffers_type>::value, "buffers_type is not trivially copyable!");
+  // static_assert(std::is_trivially_assignable<buffers_type, buffers_type>::value, "buffers_type is not trivially assignable!");
+  // static_assert(std::is_trivially_destructible<buffers_type>::value, "buffers_type is not trivially destructible!");
+  // static_assert(std::is_trivially_copy_constructible<buffers_type>::value, "buffers_type is not trivially copy constructible!");
+  // static_assert(std::is_trivially_move_constructible<buffers_type>::value, "buffers_type is not trivially move constructible!");
+  // static_assert(std::is_trivially_copy_assignable<buffers_type>::value, "buffers_type is not trivially copy assignable!");
+  // static_assert(std::is_trivially_move_assignable<buffers_type>::value, "buffers_type is not trivially move assignable!");
+  static_assert(std::is_standard_layout<buffers_type>::value, "buffers_type is not a standard layout type!");
+#endif
+  //! The i/o request type used by this handle. Guaranteed to be `TrivialType` apart from construction, and `StandardLayoutType`.
+  template <class T> struct io_request
+  {
+    T buffers{};
+    extent_type offset{0};
+    constexpr io_request() {}  // NOLINT (defaulting this breaks clang and GCC, so don't do it!)
+    constexpr io_request(T _buffers, extent_type _offset)
+        : buffers(std::move(_buffers))
+        , offset(_offset)
+    {
+    }
+  };
+#ifndef NDEBUG
+  // Is trivial in all ways, except default constructibility
+  static_assert(std::is_trivially_copyable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copyable!");
+  // static_assert(std::is_trivially_assignable<io_request<buffers_type>, io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially assignable!");
+  // static_assert(std::is_trivially_destructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially destructible!");
+  // static_assert(std::is_trivially_copy_constructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copy constructible!");
+  // static_assert(std::is_trivially_move_constructible<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially move constructible!");
+  // static_assert(std::is_trivially_copy_assignable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially copy assignable!");
+  // static_assert(std::is_trivially_move_assignable<io_request<buffers_type>>::value, "io_request<buffers_type> is not trivially move assignable!");
+  static_assert(std::is_standard_layout<io_request<buffers_type>>::value, "io_request<buffers_type> is not a standard layout type!");
+#endif
+  //! The i/o result type used by this handle. Guaranteed to be `TrivialType` apart from construction.
+  template <class T> struct io_result : public LLFIO_V2_NAMESPACE::result<T>
+  {
+    using Base = LLFIO_V2_NAMESPACE::result<T>;
+    size_type _bytes_transferred{static_cast<size_type>(-1)};
+
+#if defined(_MSC_VER) && !defined(__clang__)  // workaround MSVC parsing bug
+    constexpr io_result()
+        : Base()
+    {
+    }
+    template <class... Args>
+    constexpr io_result(Args &&... args)
+        : Base(std::forward<Args>(args)...)
+    {
+    }
+#else
+    using Base::Base;
+    io_result() = default;
+#endif
+    ~io_result() = default;
+    io_result &operator=(io_result &&) = default;  // NOLINT
+#if LLFIO_EXPERIMENTAL_STATUS_CODE
+    io_result(const io_result &) = delete;
+    io_result &operator=(const io_result &) = delete;
+#else
+    io_result(const io_result &) = default;
+    io_result &operator=(const io_result &) = default;
+#endif
+    io_result(io_result &&) = default;  // NOLINT
+    //! Returns bytes transferred
+    size_type bytes_transferred() noexcept
+    {
+      if(_bytes_transferred == static_cast<size_type>(-1))
+      {
+        _bytes_transferred = 0;
+        for(auto &i : this->value())
+        {
+          _bytes_transferred += i.size();
+        }
+      }
+      return _bytes_transferred;
+    }
+  };
+#if !defined(NDEBUG) && !LLFIO_EXPERIMENTAL_STATUS_CODE
+  // Is trivial in all ways, except default constructibility
+  static_assert(std::is_trivially_copyable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copyable!");
+// static_assert(std::is_trivially_assignable<io_result<buffers_type>, io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially assignable!");
+// static_assert(std::is_trivially_destructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially destructible!");
+// static_assert(std::is_trivially_copy_constructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copy constructible!");
+// static_assert(std::is_trivially_move_constructible<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially move constructible!");
+// static_assert(std::is_trivially_copy_assignable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially copy assignable!");
+// static_assert(std::is_trivially_move_assignable<io_result<buffers_type>>::value, "io_result<buffers_type> is not trivially move assignable!");
+//! \todo Why is io_result<buffers_type> not a standard layout type?
+// static_assert(std::is_standard_layout<result<buffers_type>>::value, "result<buffers_type> is not a standard layout type!");
+// static_assert(std::is_standard_layout<io_result<buffers_type>>::value, "io_result<buffers_type> is not a standard layout type!");
+#endif
+
   /*! \brief Choose the best available i/o context implementation for this platform.
    */
   static LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> best_available(size_t threads) noexcept;
@@ -245,6 +653,15 @@ public:
   convenience wrapper for `.post()`.
   */
   co_post_self_to_context_awaitable co_post_self_to_context() { return co_post_self_to_context_awaitable(this); }
+
+protected:
+  template <bool use_atomic> using _co_read_awaitable = io_awaitable<buffers_type, use_atomic>;
+  template <bool use_atomic> using _co_write_awaitable = io_awaitable<const_buffers_type, use_atomic>;
+  template <bool use_atomic> using _co_barrier_awaitable = io_awaitable<const_buffers_type, use_atomic>;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _run_until_read_ready(_co_read_awaitable<false>::promise_type &&p) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _run_until_write_ready(_co_write_awaitable<false>::promise_type &&p) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _run_until_barrier_ready(_co_barrier_awaitable<false>::promise_type &&p) noexcept = 0;
 #endif
 };
 
