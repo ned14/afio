@@ -137,10 +137,9 @@ result<section_handle> section_handle::section(file_handle &backing, extent_type
   static wchar_t *bufferid = wcschr(buffer, 0);
   if(_flag & flag::singleton)
   {
-    OUTCOME_TRY(currentpath, backing.current_path());
-    auto hash = QUICKCPPLIB_NAMESPACE::algorithm::hash::fast_hash::hash(reinterpret_cast<const char *>(currentpath.native().data()), currentpath.native().size() * sizeof(wchar_t));
+    auto unique_id = backing.unique_id();
     auto *_buffer = reinterpret_cast<char *>(bufferid);
-    QUICKCPPLIB_NAMESPACE::algorithm::string::to_hex_string(_buffer, 96 * sizeof(wchar_t), reinterpret_cast<const char *>(hash.as_bytes), sizeof(hash.as_bytes));
+    QUICKCPPLIB_NAMESPACE::algorithm::string::to_hex_string(_buffer, 96 * sizeof(wchar_t), reinterpret_cast<char *>(unique_id.as_bytes), sizeof(unique_id));
     for(size_t n = 31; n <= 31; n--)
     {
       bufferid[n] = _buffer[n];
