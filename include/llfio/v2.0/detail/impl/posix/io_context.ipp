@@ -41,82 +41,42 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
   using _lock_guard = typename _base::_lock_guard;
   int _epollh{-1};
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  using _io_kind = typename _base::_io_kind;
-  template <class Promise = void> using _coroutine_handle = typename _base::template _coroutine_handle<Promise>;
+  using _co_read_awaitable = typename _base::_co_read_awaitable<use_atomic>;
+  using _co_write_awaitable = typename _base::_co_write_awaitable<use_atomic>;
+  using _co_barrier_awaitable = typename _base::_co_barrier_awaitable<use_atomic>;
+  using _co_read_promise_type = typename _co_read_awaitable::promise_type;
+  using _co_write_promise_type = typename _co_write_awaitable::promise_type;
+  using _co_barrier_promise_type = typename _co_barrier_awaitable::promise_type;
+
   struct registered_handle
   {
     static constexpr size_t max_ios_outstanding = 64;
+    enum io_kind{unused, read, write, barrier};
     struct epoll_event ev;
     struct io_outstanding_t
     {
-      _io_kind kind{_io_kind::unknown};
+      io_outstanding_t *prev{nullptr}, *next{nullptr};
       std::chrono::steady_clock::time_point deadline_duration;
       std::chrono::system_clock::time_point deadline_absolute;
-      _coroutine_handle<> co;  // coroutine to resume when i/o completes
-    } io_outstanding[max_ios_outstanding];
-    size_t io_with_deadlines{0};
+      io_kind kind{io_kind::unused};
+      union {
+        OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
+        _co_read_promise_type read_promise;
+        _co_write_promise_type write_promise;
+        _co_barrier_promise_type barrier_promise;
+      };
+    } * next_io_outstanding{nullptr}, *free_io_outstanding{nullptr};
 
     registered_handle() = default;
     explicit registered_handle(struct epoll_event _ev)
         : ev(_ev)
     {
     }
-    void remove_io(io_outstanding_t &i)
-    {
-      if(i.deadline_duration != std::chrono::steady_clock::time_point() || i.deadline_absolute != std::chrono::system_clock::time_point())
-      {
-        assert(false);
-      }
-      memmove(&i, &i + 1, (&io_outstanding[max_ios_outstanding - 1] - &i) * sizeof(io_outstanding_t));
-      io_outstanding[max_ios_outstanding - 1].kind = _io_kind::unknown;
-      io_outstanding[max_ios_outstanding - 1].co = {};
-    }
   };
   using _registered_handles_map_type = std::unordered_map<int, registered_handle>;
   _registered_handles_map_type _registered_handles;
-  std::multimap<std::chrono::steady_clock::time_point, typename _registered_handles_map_type::iterator> _durations;
-  std::multimap<std::chrono::system_clock::time_point, typename _registered_handles_map_type::iterator> _absolutes;
-
-  void _remove_io(typename _registered_handles_map_type::iterator it, typename registered_handle::io_outstanding_t &i)
-  {
-    if(i.deadline_duration != std::chrono::steady_clock::time_point())
-    {
-      auto dit = _durations.find(i.deadline_duration);
-      if(dit == _durations.end())
-      {
-        abort();
-      }
-      while(dit->first == i.deadline_duration && dit->second != it)
-      {
-        ++dit;
-      }
-      if(dit->first != i.deadline_duration)
-      {
-        abort();
-      }
-      _durations.erase(dit);
-      i.deadline_duration = {};
-    }
-    if(i.deadline_absolute != std::chrono::system_clock::time_point())
-    {
-      auto dit = _absolutes.find(i.deadline_absolute);
-      if(dit == _absolutes.end())
-      {
-        abort();
-      }
-      while(dit->first == i.deadline_absolute && dit->second != it)
-      {
-        ++dit;
-      }
-      if(dit->first != i.deadline_absolute)
-      {
-        abort();
-      }
-      _absolutes.erase(dit);
-      i.deadline_absolute = {};
-    }
-    it->second.remove_io(i);
-  }
+  std::multimap<std::chrono::steady_clock::time_point, typename registered_handle::io_outstanding_t *> _durations;
+  std::multimap<std::chrono::system_clock::time_point, typename registered_handle::io_outstanding_t *> _absolutes;
 #endif
 
 public:
@@ -133,22 +93,11 @@ public:
   {
     this->_lock.lock();
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-    for(auto &x : _registered_handles)
+    if(!_registered_handles.empty())
     {
-      (void) epoll_ctl(_epollh, EPOLL_CTL_DEL, x.first, &x.second.ev);
-      for(auto &i : x.second.io_outstanding)
-      {
-        if(i.kind == _io_kind::unknown)
-        {
-          break;
-        }
-        if(i.co)
-        {
-          i.co.destroy();
-        }
-      }
+      LLFIO_LOG_FATAL(nullptr, "linux_epoll_impl::~linux_epoll_impl() called with registered i/o handles");
+      abort();
     }
-    _registered_handles.clear();
 #endif
     (void) ::close(_epollh);
   }
@@ -180,8 +129,16 @@ public:
       {
         return posix_error();
       }
+      registered_handle r(ev);
+      // Preallocate i/o structures
+      for(size_t n = 0; n < registered_handle::max_ios_outstanding; n++)
+      {
+        auto *i = new registered_handle::io_outstanding_t;
+        i->next = r.free_io_outstanding;
+        r.free_io_outstanding = i;
+      }
       _lock_guard g(this->_lock);
-      _registered_handles.insert({h->native_handle().fd, registered_handle(ev)});
+      _registered_handles.insert({h->native_handle().fd, std::move(r)});
       return success();
     }
     catch(...)
@@ -198,13 +155,32 @@ public:
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
     try
     {
-      struct epoll_event ev;
-      if(-1 == epoll_ctl(_epollh, EPOLL_CTL_DEL, h->native_handle().fd, &ev))
+      registered_handle r;
+      {
+        _lock_guard g(this->_lock);
+        auto it = _registered_handles.find(h->native_handle().fd);
+        if(it == _registered_handles.end())
+        {
+          abort();
+        }
+        if(it->second.next_io_outstanding != nullptr)
+        {
+          return errc::operation_in_progress;
+        }
+        r = std::move(it->second);
+        _registered_handles.erase(it);
+      }
+      if(-1 == epoll_ctl(_epollh, EPOLL_CTL_DEL, h->native_handle().fd, &r.ev))
       {
         return posix_error();
       }
-      _lock_guard g(this->_lock);
-      _registered_handles.erase(h->native_handle().fd);
+      assert(r.next_io_outstanding == nullptr);
+      while(r.free_io_outstanding != nullptr)
+      {
+        auto *i = r.free_io_outstanding;
+        r.free_io_outstanding = i->next;
+        delete i;
+      }
       return success();
     }
     catch(...)
@@ -234,7 +210,7 @@ public:
       std::chrono::system_clock::time_point deadline_absolute;
       // Shorten the timeout if necessary
       {
-        typename _registered_handles_map_type::iterator resume_timed_out = _registered_handles.end();
+        typename registered_handle::io_outstanding_t *resume_timed_out = nullptr;
         _lock_guard g(this->_lock);
         if(!_durations.empty())
         {
@@ -262,23 +238,109 @@ public:
             mstimeout = togo;
           }
         }
-        // Somebody has already timed out, so resume them
-        if(resume_timed_out != _registered_handles.end())
-        {
-          for(auto &i : resume_timed_out->second.io_outstanding)
+        auto io_completed = [&](auto it, registered_handle::io_outstanding_t *i, auto value) {
+          // Detach myself from the pending lists
+          if(i->deadline_duration != std::chrono::steady_clock::time_point())
           {
-            if(i.kind == _io_kind::unknown)
+            auto dit = _durations.find(i->deadline_duration);
+            if(dit == _durations.end())
             {
+              abort();
+            }
+            while(dit->first == i->deadline_duration && dit->second != it)
+            {
+              ++dit;
+            }
+            if(dit->first != i->deadline_duration)
+            {
+              abort();
+            }
+            _durations.erase(dit);
+            i->deadline_duration = {};
+          }
+          if(i->deadline_absolute != std::chrono::system_clock::time_point())
+          {
+            auto dit = _absolutes.find(i->deadline_absolute);
+            if(dit == _absolutes.end())
+            {
+              abort();
+            }
+            while(dit->first == i->deadline_absolute && dit->second != it)
+            {
+              ++dit;
+            }
+            if(dit->first != i->deadline_absolute)
+            {
+              abort();
+            }
+            _absolutes.erase(dit);
+            i->deadline_absolute = {};
+          }
+          if(i->next != nullptr)
+          {
+            i->next->prev = i->prev;
+          }
+          if(i->prev != nullptr)
+          {
+            i->prev->next = i->next;
+          }
+          else
+          {
+            assert(it->second.next_io_outstanding == i);
+            it->second.next_io_outstanding = nullptr;
+          }
+          i->next = nullptr;
+          i->prev = nullptr;
+          g.unlock();
+          switch(i->kind)
+          {
+          default:
+            abort();
+          case registered_handle::read:
+            i->read_promise.return_value(std::move(value));
+            if(i->read_promise.continuation)
+            {
+              i->read_promise.continuation.resume();
+            }
+            i->read_promise.~_co_read_promise_type();
+            break;
+          case registered_handle::write:
+            i->write_promise.return_value(std::move(value));
+            if(i->write_promise.continuation)
+            {
+              i->write_promise.continuation.resume();
+            }
+            i->write_promise.~_co_write_promise_type();
+            break;
+          }
+          i->kind = registered_handle::unused;
+          g.lock();
+          i->next = it->free_io_outstanding;
+          it->free_io_outstanding = i;
+        };
+        // Set timed out
+        if(resume_timed_out != nullptr)
+        {
+          if((resume_timed_out->deadline_duration != std::chrono::steady_clock::time_point() && resume_timed_out->deadline_duration == deadline_duration) || (resume_timed_out->deadline_absolute != std::chrono::system_clock::time_point() && resume_timed_out->deadline_absolute == deadline_absolute))
+          {
+            typename _registered_handles_map_type::iterator it;
+            switch(i->kind)
+            {
+            default:
+              abort();
+            case registered_handle::read:
+              it = _registered_handles.find(resume_timed_out->read_promise.nativeh.fd);
+              break;
+            case registered_handle::write:
+              it = _registered_handles.find(resume_timed_out->write_promise.nativeh.fd);
               break;
             }
-            if((i.deadline_duration != std::chrono::steady_clock::time_point() && i.deadline_duration == deadline_duration) || (i.deadline_absolute != std::chrono::system_clock::time_point() && i.deadline_absolute == deadline_absolute))
+            if(it == _registered_handles.end())
             {
-              auto co = i.co;
-              _remove_io(resume_timed_out, i);
-              g.unlock();
-              co.resume();
-              return true;
+              abort();
             }
+            io_completed(it, resume_timed_out, errc::timed_out);
+            return true;
           }
         }
       }
@@ -303,37 +365,47 @@ public:
           abort();
         }
         // Resume the earliest pending i/o matching read/write
-        for(auto &i : it->second.io_outstanding)
+        for(registered_handle::io_outstanding_t *i = it->second.next_io_outstanding; i != nullptr; i = i->next)
         {
-          if(i.kind == _io_kind::unknown)
+          // Does this i/o match? If it's an error, wake the earliest irrespective.
+          switch(i->kind)
           {
+          default:
+            abort();
+          case registered_handle::read:
+            if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::read && (ev.events & EPOLLIN) != 0))
+            {
+              // Reattempt the i/o
+              io_handle wrapper(i->read_promise.nativeh);
+              g.unlock();
+              io_result<buffers_type> result = wrapper.read(i->read_promise.reqs, std::chrono::seconds(0));
+              wrapper.release();
+              g.lock();
+              if(result)
+              {
+                // Complete with the result
+                io_completed(it, i, std::move(result));
+                return true;
+              }
+            }
             break;
-          }
-          if((ev.events & (EPOLLHUP | EPOLLERR)) != 0)
-          {
-            // wake everything
-            auto co = i.co;
-            _remove_io(it, i);
-            g.unlock();
-            co.resume();
-            g.lock();
-            continue;
-          }
-          if(i.kind == _io_kind::read && (ev.events & EPOLLIN) != 0)
-          {
-            auto co = i.co;
-            _remove_io(it, i);
-            g.unlock();
-            co.resume();
-            return true;
-          }
-          if(i.kind == _io_kind::write && (ev.events & EPOLLOUT) != 0)
-          {
-            auto co = i.co;
-            _remove_io(it, i);
-            g.unlock();
-            co.resume();
-            return true;
+          case registered_handle::write:
+            if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::write && (ev.events & EPOLLOUT) != 0))
+            {
+              // Reattempt the i/o
+              io_handle wrapper(i->write_promise.nativeh);
+              g.unlock();
+              io_result<buffers_type> result = wrapper.write(i->write_promise.reqs, std::chrono::seconds(0));
+              wrapper.release();
+              g.lock();
+              if(result)
+              {
+                // Complete with the result
+                io_completed(it, i, std::move(result));
+                return true;
+              }
+            }
+            break;
           }
         }
       }
@@ -341,36 +413,41 @@ public:
     }
   }
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  virtual result<void> _await_io_handle_ready(typename _base::_await_io_handle_ready_awaitable *aw, _coroutine_handle<> co) noexcept override final
+  template <class D, class S> typename S::awaitable_type _move_if_same_and_return_awaitable(D *dest, S &&s) { abort(); }
+  template <class D> typename D::awaitable_type _move_if_same_and_return_awaitable(D *dest, D &&s)
+  {
+    // Put the promise into its final resting place, and return an awaitable pointing at that promise
+    auto *p = new(dest) D(std::move(s));
+    return p->get_return_object();
+  }
+  template <class Promise> typename Promise::awaitable_type _add_promise_to_wake_list(typename registered_handle::io_kind kind, Promise &&p) noexcept
   {
     try
     {
-      LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(aw->_d);
-      // Set this coroutine to be resumed when the i/o completes
-      bool nospace = true;
+      LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(p.d);
       _lock_guard g(this->_lock);
-      auto it = _registered_handles.find(aw->_h->native_handle().fd);
+      auto it = _registered_handles.find(p.h->native_handle().fd);
       if(it == _registered_handles.end())
       {
         abort();
       }
       for(auto &i : it->second.io_outstanding)
       {
-        if(i.kind == _io_kind::unknown)
+        if(i.kind == registered_handle::unused)
         {
-          i.kind = aw->_kind;
-          if(aw->_d)
+          i.kind = kind;
+          if(p.d)
           {
-            if(aw->_d.steady)
+            if(p.d.steady)
             {
-              i.deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(aw->_d.nsecs);
+              i.deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(p.d.nsecs);
               i.deadline_absolute = {};
               _durations.insert({i.deadline_duration, it});
             }
             else
             {
               i.deadline_duration = {};
-              i.deadline_absolute = aw->_d.to_time_point();
+              i.deadline_absolute = p.d.to_time_point();
               _absolutes.insert({i.deadline_absolute, it});
             }
           }
@@ -379,22 +456,34 @@ public:
             i.deadline_duration = {};
             i.deadline_absolute = {};
           }
-          i.co = co;
-          nospace = false;
-          break;
+          if((&i - io_outstanding) + 1 > io_outstanding_top)
+          {
+            io_outstanding_top = (&i - io_outstanding) + 1;
+          }
+          switch(kind)
+          {
+          default:
+            abort();
+          case registered_handle::read:
+            return _move_if_same_and_return_awaitable(&i.read_promise, std::move(p));
+          case registered_handle::write:
+            return _move_if_same_and_return_awaitable(&i.write_promise, std::move(p));
+          }
         }
       }
-      if(nospace)
-      {
-        return errc::resource_unavailable_try_again;  // not enough i/o slots
-      }
-      // This i/o is registered for later resumption!
-      return success();
+      return errc::resource_unavailable_try_again;  // not enough i/o slots
     }
     catch(...)
     {
       return error_from_exception();
     }
+  }
+  virtual _co_read_awaitable _run_until_read_ready(_co_read_promise_type &&p) noexcept { return _add_promise_to_wake_list(registered_handle::read, std::move(p)); }
+  virtual _co_write_awaitable _run_until_write_ready(_co_write_promise_type &&p) noexcept { return _add_promise_to_wake_list(registered_handle::write, std::move(p)); }
+  virtual _co_barrier_awaitable _run_until_barrier_ready(_co_barrier_promise_type && /*unused*/) noexcept
+  {
+    // Not implemented for the epoll() context
+    abort();
   }
 #endif
 };

@@ -47,6 +47,7 @@ using OUTCOME_V2_NAMESPACE::awaitables::suspend_never;
 //! \brief The promise type for an i/o awaitable
 template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
 {
+  using awaitable_type = Awaitable;
   using container_type = io_result<typename Awaitable::container_type>;
   using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
   union {
@@ -55,7 +56,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   };
   result_set_type result_set{false};
   coroutine_handle<> continuation;
-  handle *h{nullptr};
+  native_handle_type nativeh;
   io_request<typename Awaitable::container_type> reqs{};
   deadline d{};
 
@@ -63,7 +64,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   io_awaitable_promise_type() {}
   // Constructor used by co_read|co_write|co_barrier
   io_awaitable_promise_type(handle *_h, io_request<typename Awaitable::container_type> _reqs, deadline _d)
-      : h(_h)
+      : nativeh(_h->native_handle())
       , reqs(_reqs)
       , d(_d)
   {
