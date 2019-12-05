@@ -344,6 +344,15 @@ LLFIO_V2_NAMESPACE_END
 LLFIO_V2_NAMESPACE_BEGIN
 using namespace QUICKCPPLIB_NAMESPACE::string_view;
 LLFIO_V2_NAMESPACE_END
+// Bring in a function_ptr implementation
+#include "quickcpplib/function_ptr.hpp"
+LLFIO_V2_NAMESPACE_BEGIN
+template <class F, size_t callable_storage_bytes = 32 - sizeof(uintptr_t)> using function_ptr = QUICKCPPLIB_NAMESPACE::function_ptr::function_ptr<F, callable_storage_bytes>;
+using QUICKCPPLIB_NAMESPACE::function_ptr::emplace_function_ptr;
+using QUICKCPPLIB_NAMESPACE::function_ptr::emplace_function_ptr_nothrow;
+using QUICKCPPLIB_NAMESPACE::function_ptr::make_function_ptr;
+using QUICKCPPLIB_NAMESPACE::function_ptr::make_function_ptr_nothrow;
+LLFIO_V2_NAMESPACE_END
 // Bring in an ensure_flushes implementation
 #include "quickcpplib/mem_flush_loads_stores.hpp"
 LLFIO_V2_NAMESPACE_BEGIN

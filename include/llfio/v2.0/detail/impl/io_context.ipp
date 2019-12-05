@@ -56,17 +56,17 @@ protected:
   using _lock_guard = std::conditional_t<threadsafe, std::unique_lock<std::mutex>, _fake_lock_guard>;
   std::mutex _lock;
   std::atomic<bool> _nonzero_items_posted{false};
-  detail::function_ptr<void *(void *)> _items_posted, *_last_item_posted{nullptr};
+  function_ptr<void *(void *)> _items_posted, *_last_item_posted{nullptr};
 
   bool _execute_posted_items()
   {
     if(_nonzero_items_posted.load(std::memory_order_acquire))
     {
-      detail::function_ptr<void *(void *)> i, empty;
+      function_ptr<void *(void *)> i, empty;
       {
         std::lock_guard<std::mutex> h(_lock);  // need real locking here
         i = std::move(_items_posted);           // Detach item from front
-        _items_posted = std::move(*reinterpret_cast<detail::function_ptr<void *(void *)> *>(i(&empty)));
+        _items_posted = std::move(*reinterpret_cast<function_ptr<void *(void *)> *>(i(&empty)));
         if(!_items_posted)
         {
           _last_item_posted = nullptr;
@@ -86,16 +86,16 @@ public:
   {
     if(_nonzero_items_posted)
     {
-      detail::function_ptr<void *(void *)> empty;
+      function_ptr<void *(void *)> empty;
       while(_items_posted)
       {
-        auto &next = *reinterpret_cast<detail::function_ptr<void *(void *)> *>(_items_posted(&empty));
+        auto &next = *reinterpret_cast<function_ptr<void *(void *)> *>(_items_posted(&empty));
         _items_posted = std::move(next);
       }
     }
   }
 
-  virtual void _post(detail::function_ptr<void *(void *)> &&f) noexcept override final
+  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
   {
     std::lock_guard<std::mutex> h(_lock);  // need real locking here
     if(_last_item_posted == nullptr)
@@ -106,7 +106,7 @@ public:
       return;
     }
     // Store the new item into the most recently posted item
-    _last_item_posted = reinterpret_cast<detail::function_ptr<void *(void *)> *>((*_last_item_posted)(&f));
+    _last_item_posted = reinterpret_cast<function_ptr<void *(void *)> *>((*_last_item_posted)(&f));
   }
 };
 

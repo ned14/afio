@@ -41,9 +41,9 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
   using _lock_guard = typename _base::_lock_guard;
   int _epollh{-1};
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  using _co_read_awaitable = typename _base::_co_read_awaitable<use_atomic>;
-  using _co_write_awaitable = typename _base::_co_write_awaitable<use_atomic>;
-  using _co_barrier_awaitable = typename _base::_co_barrier_awaitable<use_atomic>;
+  using _co_read_awaitable = typename _base::template _co_read_awaitable<threadsafe>;
+  using _co_write_awaitable = typename _base::template _co_write_awaitable<threadsafe>;
+  using _co_barrier_awaitable = typename _base::template _co_barrier_awaitable<threadsafe>;
   using _co_read_promise_type = typename _co_read_awaitable::promise_type;
   using _co_write_promise_type = typename _co_write_awaitable::promise_type;
   using _co_barrier_promise_type = typename _co_barrier_awaitable::promise_type;
@@ -65,7 +65,7 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
         _co_write_promise_type write_promise;
         _co_barrier_promise_type barrier_promise;
       };
-    } * next_io_outstanding{nullptr}, *free_io_outstanding{nullptr};
+    } * next_io_outstanding{nullptr}, *last_io_outstanding{nullptr}, *free_io_outstanding{nullptr};
 
     registered_handle() = default;
     explicit registered_handle(struct epoll_event _ev)
@@ -133,7 +133,7 @@ public:
       // Preallocate i/o structures
       for(size_t n = 0; n < registered_handle::max_ios_outstanding; n++)
       {
-        auto *i = new registered_handle::io_outstanding_t;
+        auto *i = new typename registered_handle::io_outstanding_t;
         i->next = r.free_io_outstanding;
         r.free_io_outstanding = i;
       }
@@ -238,7 +238,7 @@ public:
             mstimeout = togo;
           }
         }
-        auto io_completed = [&](auto it, registered_handle::io_outstanding_t *i, auto value) {
+        auto io_completed = [&](auto it, typename registered_handle::io_outstanding_t *i, auto value) {
           // Detach myself from the pending lists
           if(i->deadline_duration != std::chrono::steady_clock::time_point())
           {
@@ -280,6 +280,11 @@ public:
           {
             i->next->prev = i->prev;
           }
+          else
+          {
+            assert(it->second.last_io_outstanding == i);
+            it->second.last_io_outstanding = i->prev;
+          }
           if(i->prev != nullptr)
           {
             i->prev->next = i->next;
@@ -287,7 +292,7 @@ public:
           else
           {
             assert(it->second.next_io_outstanding == i);
-            it->second.next_io_outstanding = nullptr;
+            it->second.next_io_outstanding = i->next;
           }
           i->next = nullptr;
           i->prev = nullptr;
@@ -324,7 +329,7 @@ public:
           if((resume_timed_out->deadline_duration != std::chrono::steady_clock::time_point() && resume_timed_out->deadline_duration == deadline_duration) || (resume_timed_out->deadline_absolute != std::chrono::system_clock::time_point() && resume_timed_out->deadline_absolute == deadline_absolute))
           {
             typename _registered_handles_map_type::iterator it;
-            switch(i->kind)
+            switch(resume_timed_out->kind)
             {
             default:
               abort();
@@ -365,7 +370,7 @@ public:
           abort();
         }
         // Resume the earliest pending i/o matching read/write
-        for(registered_handle::io_outstanding_t *i = it->second.next_io_outstanding; i != nullptr; i = i->next)
+        for(typename registered_handle::io_outstanding_t *i = it->second.next_io_outstanding; i != nullptr; i = i->next)
         {
           // Does this i/o match? If it's an error, wake the earliest irrespective.
           switch(i->kind)
@@ -376,10 +381,9 @@ public:
             if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::read && (ev.events & EPOLLIN) != 0))
             {
               // Reattempt the i/o
-              io_handle wrapper(i->read_promise.nativeh);
+              assert(i->read_promise.extra_in_use == 1);
               g.unlock();
-              io_result<buffers_type> result = wrapper.read(i->read_promise.reqs, std::chrono::seconds(0));
-              wrapper.release();
+              auto result = i->extra.erased_op(i->read_promise);
               g.lock();
               if(result)
               {
@@ -393,10 +397,9 @@ public:
             if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::write && (ev.events & EPOLLOUT) != 0))
             {
               // Reattempt the i/o
-              io_handle wrapper(i->write_promise.nativeh);
+              assert(i->write_promise.extra_in_use == 1);
               g.unlock();
-              io_result<buffers_type> result = wrapper.write(i->write_promise.reqs, std::chrono::seconds(0));
-              wrapper.release();
+              auto result = i->extra.erased_op(i->write_promise);
               g.lock();
               if(result)
               {
@@ -413,7 +416,7 @@ public:
     }
   }
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-  template <class D, class S> typename S::awaitable_type _move_if_same_and_return_awaitable(D *dest, S &&s) { abort(); }
+  template <class D, class S> typename S::awaitable_type _move_if_same_and_return_awaitable(D * /*unused*/, S && /*unused*/) { abort(); }
   template <class D> typename D::awaitable_type _move_if_same_and_return_awaitable(D *dest, D &&s)
   {
     // Put the promise into its final resting place, and return an awaitable pointing at that promise
@@ -431,56 +434,57 @@ public:
       {
         abort();
       }
-      for(auto &i : it->second.io_outstanding)
+      if(it->second.free_io_outstanding == nullptr)
       {
-        if(i.kind == registered_handle::unused)
+        return errc::resource_unavailable_try_again;  // not enough i/o slots
+      }
+      auto *i = it->second.free_io_outstanding;
+      if(p.d)
+      {
+        if(p.d.steady)
         {
-          i.kind = kind;
-          if(p.d)
-          {
-            if(p.d.steady)
-            {
-              i.deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(p.d.nsecs);
-              i.deadline_absolute = {};
-              _durations.insert({i.deadline_duration, it});
-            }
-            else
-            {
-              i.deadline_duration = {};
-              i.deadline_absolute = p.d.to_time_point();
-              _absolutes.insert({i.deadline_absolute, it});
-            }
-          }
-          else
-          {
-            i.deadline_duration = {};
-            i.deadline_absolute = {};
-          }
-          if((&i - io_outstanding) + 1 > io_outstanding_top)
-          {
-            io_outstanding_top = (&i - io_outstanding) + 1;
-          }
-          switch(kind)
-          {
-          default:
-            abort();
-          case registered_handle::read:
-            return _move_if_same_and_return_awaitable(&i.read_promise, std::move(p));
-          case registered_handle::write:
-            return _move_if_same_and_return_awaitable(&i.write_promise, std::move(p));
-          }
+          i->deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(p.d.nsecs);
+          i->deadline_absolute = {};
+          _durations.insert({i->deadline_duration, i});
+        }
+        else
+        {
+          i->deadline_duration = {};
+          i->deadline_absolute = p.d.to_time_point();
+          _absolutes.insert({i->deadline_absolute, i});
         }
       }
-      return errc::resource_unavailable_try_again;  // not enough i/o slots
+      else
+      {
+        i->deadline_duration = {};
+        i->deadline_absolute = {};
+      }
+      i->kind = kind;
+      it->second.free_io_outstanding = i->next;
+      if(it->second.last_io_outstanding != nullptr)
+      {
+        it->second.last_io_outstanding->next = i;
+      }
+      i->prev = it->second.last_io_outstanding;
+      i->next = nullptr;
+      switch(kind)
+      {
+      default:
+        abort();
+      case registered_handle::read:
+        return _move_if_same_and_return_awaitable(&i->read_promise, std::move(p));
+      case registered_handle::write:
+        return _move_if_same_and_return_awaitable(&i->write_promise, std::move(p));
+      }
     }
     catch(...)
     {
       return error_from_exception();
     }
   }
-  virtual _co_read_awaitable _run_until_read_ready(_co_read_promise_type &&p) noexcept { return _add_promise_to_wake_list(registered_handle::read, std::move(p)); }
-  virtual _co_write_awaitable _run_until_write_ready(_co_write_promise_type &&p) noexcept { return _add_promise_to_wake_list(registered_handle::write, std::move(p)); }
-  virtual _co_barrier_awaitable _run_until_barrier_ready(_co_barrier_promise_type && /*unused*/) noexcept
+  virtual _co_read_awaitable<false> _run_until_read_ready(_co_read_awaitable_promise_type<false> &&p) noexcept override final { return _add_promise_to_wake_list(registered_handle::read, std::move(p)); }
+  virtual _co_write_awaitable<false> _run_until_write_ready(_co_write_awaitable_promise_type<false> &&p) noexcept override final { return _add_promise_to_wake_list(registered_handle::write, std::move(p)); }
+  virtual _co_barrier_awaitable<false> _run_until_barrier_ready(_co_barrier_awaitable_promise_type<false> &&/*unused*/) noexcept override final
   {
     // Not implemented for the epoll() context
     abort();

@@ -218,11 +218,12 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::
     do
     {
       // Can't guarantee that user code hasn't enabled SIGPIPE
-      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
-                                                                       [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
-                                                                         errno = EPIPE;
-                                                                         return -1;
-                                                                       });
+      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(
+      QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
+      [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
+        errno = EPIPE;
+        return -1;
+      });
       if(byteswritten <= 0)
       {
         if(byteswritten < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
@@ -380,7 +381,17 @@ io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> 
         if(!d || !d.steady || d.nsecs != 0)
         {
           // Have my i/o context suspend my caller until either some data for read turns up, or my deadline expires
-          io_handle::co_read_awaitable<false>::promise_type p(this, reqs, d);
+          using promise_type = io_handle::co_read_awaitable<false>::promise_type;
+          using callable_type = io_result<buffers_type>(promise_type &);
+          promise_type p(this, reqs, d);
+          new(&p.extra.erased_op) function_ptr<callable_type>(make_function_ptr_nothrow < callable_type>([](promise_type &p) {
+            // Temporarily wrap the native handle
+            io_handle wrapper(p.nativeh);
+            auto ret = wrapper.read(p.reqs, std::chrono::seconds(0));
+            wrapper.release();
+            return ret;
+          }));
+          p.extra_in_use = 1;
           return multiplexer()->_run_until_read_ready(std::move(p));
         }
         LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
@@ -401,7 +412,7 @@ io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> 
       break;
     }
   }
-  return{reqs.buffers};
+  return {reqs.buffers};
 }
 
 io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffers_type> reqs, deadline d) noexcept
@@ -447,11 +458,12 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
     do
     {
       // Can't guarantee that user code hasn't enabled SIGPIPE
-      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
-                                                                       [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
-                                                                         errno = EPIPE;
-                                                                         return -1;
-                                                                       });
+      byteswritten = QUICKCPPLIB_NAMESPACE::signal_guard::signal_guard(
+      QUICKCPPLIB_NAMESPACE::signal_guard::signalc_set::broken_pipe, [&] { return ::writev(_v.fd, iov, reqs.buffers.size()); },
+      [&](const QUICKCPPLIB_NAMESPACE::signal_guard::raised_signal_info * /*unused*/) {
+        errno = EPIPE;
+        return -1;
+      });
       if(byteswritten <= 0)
       {
         if(byteswritten < 0 && EWOULDBLOCK != errno && EAGAIN != errno)
@@ -462,7 +474,17 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
         if(!d || !d.steady || d.nsecs != 0)
         {
           // Have my i/o context suspend my caller until either some space for write turns up, or my deadline expires
-          io_handle::co_write_awaitable<false>::promise_type p(this, reqs, d);
+          using promise_type = io_handle::co_write_awaitable<false>::promise_type;
+          using callable_type = io_result<const_buffers_type>(promise_type &);
+          promise_type p(this, reqs, d);
+          new(&p.extra.erased_op) function_ptr<callable_type>(make_function_ptr_nothrow < callable_type>([](promise_type &p) {
+            // Temporarily wrap the native handle
+            io_handle wrapper(p.nativeh);
+            auto ret = wrapper.write(p.reqs, std::chrono::seconds(0));
+            wrapper.release();
+            return ret;
+          }));
+          p.extra_in_use = 1;
           return multiplexer()->_run_until_write_ready(std::move(p));
         }
         LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
@@ -483,7 +505,7 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
       break;
     }
   }
-  return{reqs.buffers};
+  return {reqs.buffers};
 }
 
 io_handle::co_barrier_awaitable<false> io_handle::co_barrier(io_request<const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept

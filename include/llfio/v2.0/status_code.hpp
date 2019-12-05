@@ -255,6 +255,9 @@ template <class T> using atomic_lazy = OUTCOME_V2_NAMESPACE::experimental::await
 template <class T> using eager = OUTCOME_V2_NAMESPACE::experimental::awaitables::eager<T>;
 template <class T> using lazy = OUTCOME_V2_NAMESPACE::experimental::awaitables::lazy<T>;
 template <class T = void> using coroutine_handle = OUTCOME_V2_NAMESPACE::awaitables::coroutine_handle<T>;
+template <class... Args> using coroutine_traits = OUTCOME_V2_NAMESPACE::awaitables::coroutine_traits<Args...>;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_always;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_never;
 #endif
 
 //! Choose an errc implementation
@@ -524,6 +527,9 @@ template <class T> using atomic_lazy = OUTCOME_V2_NAMESPACE::awaitables::atomic_
 template <class T> using eager = OUTCOME_V2_NAMESPACE::awaitables::eager<T>;
 template <class T> using lazy = OUTCOME_V2_NAMESPACE::awaitables::lazy<T>;
 template <class T = void> using coroutine_handle = OUTCOME_V2_NAMESPACE::awaitables::coroutine_handle<T>;
+template <class... Args> using coroutine_traits = OUTCOME_V2_NAMESPACE::awaitables::coroutine_traits<Args...>;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_always;
+using OUTCOME_V2_NAMESPACE::awaitables::suspend_never;
 #endif
 
 static_assert(OUTCOME_V2_NAMESPACE::trait::is_error_code_available_v<error_info>, "error_info is not detected to be an error code");

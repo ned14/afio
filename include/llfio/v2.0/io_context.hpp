@@ -27,8 +27,6 @@ Distributed under the Boost Software License, Version 1.0.
 
 #include "handle.hpp"
 
-#include "outcome/coroutine_support.hpp"
-
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4251)  // dll interface
@@ -39,196 +37,8 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 class io_handle;
 
 #ifdef OUTCOME_FOUND_COROUTINE_HEADER
-template <class Promise = void> using coroutine_handle = OUTCOME_V2_NAMESPACE::awaitables::coroutine_handle<Promise>;
-template <class... Args> using coroutine_traits = OUTCOME_V2_NAMESPACE::awaitables::coroutine_traits<Args...>;
-using OUTCOME_V2_NAMESPACE::awaitables::suspend_always;
-using OUTCOME_V2_NAMESPACE::awaitables::suspend_never;
-
-//! \brief The promise type for an i/o awaitable
-template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
-{
-  using awaitable_type = Awaitable;
-  using container_type = io_result<typename Awaitable::container_type>;
-  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
-  union {
-    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-    container_type result;
-  };
-  result_set_type result_set{false};
-  coroutine_handle<> continuation;
-  native_handle_type nativeh;
-  io_request<typename Awaitable::container_type> reqs{};
-  deadline d{};
-
-  // Constructor used by coroutines
-  io_awaitable_promise_type() {}
-  // Constructor used by co_read|co_write|co_barrier
-  io_awaitable_promise_type(handle *_h, io_request<typename Awaitable::container_type> _reqs, deadline _d)
-      : nativeh(_h->native_handle())
-      , reqs(_reqs)
-      , d(_d)
-  {
-  }
-  io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
-  io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
-      : result_set(o.result_set.load())
-      , continuation(o.continuation)
-  {
-    if(result_set.load(std::memory_order_acquire))
-    {
-      new(&result) container_type(static_cast<container_type &&>(o.result));
-    }
-    o.continuation = {};
-  }
-  io_awaitable_promise_type &operator=(const io_awaitable_promise_type &) = delete;
-  io_awaitable_promise_type &operator=(io_awaitable_promise_type &&) = delete;
-  ~io_awaitable_promise_type()
-  {
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.~container_type();
-    }
-  }
-  auto get_return_object() { return Awaitable{*this}; }
-  void return_value(container_type &&value)
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.~container_type();
-    }
-    new(&result) container_type(static_cast<container_type &&>(value));
-    result_set.store(true, std::memory_order_release);
-  }
-  void return_value(const container_type &value)
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.~container_type();
-    }
-    new(&result) container_type(value);
-    result_set.store(true, std::memory_order_release);
-  }
-  void unhandled_exception()
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.~container_type();
-    }
-#ifdef __cpp_exceptions
-    auto e = std::current_exception();
-    auto ec = detail::error_from_exception(static_cast<decltype(e) &&>(e), {});
-    // Try to set error code first
-    if(!detail::error_is_set(ec) || !detail::try_set_error(ec, &result))
-    {
-      detail::set_or_rethrow(e, &result);
-    }
-#else
-    std::terminate();
-#endif
-    result_set.store(true, std::memory_order_release);
-  }
-  auto initial_suspend() noexcept
-  {
-    struct awaiter
-    {
-      bool await_ready() noexcept { return true; }
-      void await_resume() noexcept {}
-      void await_suspend(coroutine_handle<> /*unused*/) {}
-    };
-    return awaiter{};
-  }
-  auto final_suspend()
-  {
-    struct awaiter
-    {
-      bool await_ready() noexcept { return false; }
-      void await_resume() noexcept {}
-      void await_suspend(coroutine_handle<io_awaitable_promise_type> self)
-      {
-        if(self.promise().continuation)
-        {
-          return self.promise().continuation.resume();
-        }
-      }
-    };
-    return awaiter{};
-  }
-};
-
-/*! \brief An i/o awaitable type, where the operation is attempted immediately,
-and if it can be completed immediately without blocking then the awaitable is returned ready.
-If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
-If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
-i/o completes.
-*/
-template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable
-{
-  using container_type = Cont;
-  using promise_type = outcome_promise_type<io_awaitable, use_atomic>;
-  union {
-    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-    io_result<container_type> _immediate_result;
-  };
-  coroutine_handle<promise_type> _h;
-
-public:
-  io_awaitable(io_awaitable &&o) noexcept
-      : _h(static_cast<coroutine_handle<promise_type> &&>(o._h))
-  {
-    o._h = nullptr;
-    if(!_h)
-    {
-      new(&_immediate_result) container_type(static_cast<io_result<container_type> &&>(o._immediate_result));
-    }
-  }
-  io_awaitable(const io_awaitable &o) = delete;
-  io_awaitable &operator=(io_awaitable &&) = delete;  // as per P1056
-  io_awaitable &operator=(const io_awaitable &) = delete;
-  ~io_awaitable()
-  {
-    if(_h)
-    {
-      _h.destroy();
-    }
-    else
-    {
-      _immediate_result.~io_result<container_type>();
-    }
-  }
-
-  // Construct an awaitable set later by its promise
-  explicit io_awaitable(promise_type &p)
-      : _h(coroutine_handle<promise_type>::from_promise(p))
-  {
-  }
-  // Construct an awaitable which has an immediate result
-  io_awaitable(io_result<container_type> &&c)
-      : _immediate_result(static_cast<io_result<container_type> &&>(c))
-  {
-  }
-  bool await_ready() noexcept { return !_h || _h.promise().result_set.load(std::memory_order_acquire); }
-  io_result<container_type> await_resume()
-  {
-    if(!_h)
-    {
-      return static_cast<typename io_result<container_type> &&>(_immediate_result);
-    }
-    assert(_h.promise().result_set.load(std::memory_order_acquire));
-    if(!_h.promise().result_set.load(std::memory_order_acquire))
-    {
-      std::terminate();
-    }
-    return static_cast<typename io_result<container_type> &&>(_h.promise().result);
-  }
-  void await_suspend(coroutine_handle<> cont)
-  {
-    _h.promise().continuation = cont;
-    _h.resume();
-  }
-};
+template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type;
+template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable;
 #endif
 
 /*! \class io_context
@@ -592,14 +402,14 @@ public:
   LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
 
 private:
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _post(detail::function_ptr<void *(void *)> &&f) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _post(function_ptr<void *(void *)> &&f) noexcept = 0;
 
 public:
   /*! Schedule the callable to be invoked by the thread owning this object and executing `run()` at its next
   available opportunity. Unlike any other function in this API layer, this function is thread safe.
 
-  \mallocs At least one dynamic memory allocation to type erase the callable, and a mutex
-  lock/unlock cycle.
+  \mallocs Up to one dynamic memory allocation to type erase the callable (there is a
+  non-allocating small object optimisation), and a mutex lock/unlock cycle.
   */
   template <class U> result<void> post(U &&f) noexcept
   {
@@ -608,14 +418,14 @@ public:
       struct _
       {
         U f;
-        detail::function_ptr<void(void *)> next;
+        function_ptr<void(void *)> next;
         void *operator()(void *n)
         {
           if(n != nullptr)
           {
             if(!next)
             {
-              next = std::move(*reinterpret_cast<detail::function_ptr<void(void *)> *>(n));
+              next = std::move(*reinterpret_cast<function_ptr<void(void *)> *>(n));
             }
             return &next;
           }
@@ -623,7 +433,7 @@ public:
           return &next;
         }
       };
-      _post(detail::make_function_ptr<void *(void *)>(_{std::forward<U>(f), detail::function_ptr<void(void *)>()}));
+      _post(detail::make_function_ptr<void *(void *)>(_{std::forward<U>(f), function_ptr<void(void *)>()}));
       return success();
     }
     catch(...)
@@ -649,7 +459,7 @@ public:
     }
     void await_resume() {}
   };
-  /*! \brief Return aAn awaitable suspending execution of this coroutine on the current kernel thread,
+  /*! \brief Return an awaitable suspending execution of this coroutine on the current kernel thread,
   and resuming execution on the kernel thread running this i/o service. This is a
   convenience wrapper for `.post()`.
   */
@@ -660,9 +470,13 @@ protected:
   template <bool use_atomic> using _co_write_awaitable = io_awaitable<const_buffers_type, use_atomic>;
   template <bool use_atomic> using _co_barrier_awaitable = io_awaitable<const_buffers_type, use_atomic>;
 
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _run_until_read_ready(_co_read_awaitable<false>::promise_type &&p) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _run_until_write_ready(_co_write_awaitable<false>::promise_type &&p) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _run_until_barrier_ready(_co_barrier_awaitable<false>::promise_type &&p) noexcept = 0;
+  template <bool use_atomic> using _co_read_awaitable_promise_type = io_awaitable_promise_type<_co_read_awaitable<use_atomic>, use_atomic>;
+  template <bool use_atomic> using _co_write_awaitable_promise_type = io_awaitable_promise_type<_co_write_awaitable<use_atomic>, use_atomic>;
+  template <bool use_atomic> using _co_barrier_awaitable_promise_type = io_awaitable_promise_type<_co_barrier_awaitable<use_atomic>, use_atomic>;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _run_until_read_ready(_co_read_awaitable_promise_type<false> &&p) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _run_until_write_ready(_co_write_awaitable_promise_type<false> &&p) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _run_until_barrier_ready(_co_barrier_awaitable_promise_type<false> &&p) noexcept = 0;
 #endif
 };
 
@@ -674,6 +488,223 @@ namespace this_thread
   //! \brief Set the calling thread's i/o context.
   LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_context *ctx) noexcept;
 }  // namespace this_thread
+
+#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+//! \brief The promise type for an i/o awaitable
+template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
+{
+  using awaitable_type = Awaitable;
+  using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
+  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
+  union {
+    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
+    container_type result;
+  };
+  result_set_type result_set{false};
+  uint8_t extra_in_use{0};
+  coroutine_handle<> continuation;
+  native_handle_type nativeh;
+  typename io_context::template io_request<typename Awaitable::container_type> reqs{};
+  deadline d{};
+  union {
+#ifdef _WIN32
+    OVERLAPPED ols[64];
+#else
+    function_ptr<container_type(io_awaitable_promise_type &p)> erased_op;  // used by the epoll implementation to retry the operation
+#endif
+  } extra;
+
+  // Constructor used by coroutines
+  io_awaitable_promise_type() {}
+  // Constructor used by co_read|co_write|co_barrier
+  io_awaitable_promise_type(handle *_h, typename io_context::template io_request<typename Awaitable::container_type> _reqs, deadline _d)
+      : nativeh(_h->native_handle())
+      , reqs(_reqs)
+      , d(_d)
+  {
+  }
+  io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
+  io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
+      : result_set(o.result_set.load())
+      , extra_in_use(o.extra_in_use)
+      , continuation(o.continuation)
+      , nativeh(o.nativeh)
+      , reqs(o.reqs)
+      , d(o.d)
+  {
+    if(result_set.load(std::memory_order_acquire))
+    {
+      new(&result) container_type(static_cast<container_type &&>(o.result));
+    }
+    o.continuation = {};
+    if(1 == extra_in_use)
+    {
+#ifdef _WIN32
+      memcpy(ols, o.ols, sizeof(ols));
+#else
+      new(&extra.erased_op) function_ptr<container_type(io_awaitable_promise_type * p)>(std::move(o.erased_op));
+#endif
+    }
+  }
+  io_awaitable_promise_type &operator=(const io_awaitable_promise_type &) = delete;
+  io_awaitable_promise_type &operator=(io_awaitable_promise_type &&) = delete;
+  ~io_awaitable_promise_type()
+  {
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+#ifndef _WIN32
+    if(1 == extra_in_use)
+    {
+      extra.erased_op.~function_ptr<container_type(io_awaitable_promise_type * p)>();
+    }
+#endif
+  }
+  auto get_return_object() { return Awaitable{*this}; }
+  void return_value(container_type &&value)
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+    new(&result) container_type(static_cast<container_type &&>(value));
+    result_set.store(true, std::memory_order_release);
+  }
+  void return_value(const container_type &value)
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+    new(&result) container_type(value);
+    result_set.store(true, std::memory_order_release);
+  }
+  void unhandled_exception()
+  {
+    assert(!result_set.load(std::memory_order_acquire));
+    if(result_set.load(std::memory_order_acquire))
+    {
+      result.~container_type();
+    }
+#ifdef __cpp_exceptions
+    auto e = std::current_exception();
+    auto ec = OUTCOME_V2_NAMESPACE::awaitables::detail::error_from_exception(static_cast<decltype(e) &&>(e), {});
+    // Try to set error code first
+    if(!OUTCOME_V2_NAMESPACE::awaitables::detail::error_is_set(ec) || !OUTCOME_V2_NAMESPACE::awaitables::detail::try_set_error(ec, &result))
+    {
+      OUTCOME_V2_NAMESPACE::awaitables::detail::set_or_rethrow(e, &result);
+    }
+#else
+    std::terminate();
+#endif
+    result_set.store(true, std::memory_order_release);
+  }
+  auto initial_suspend() noexcept
+  {
+    struct awaiter
+    {
+      bool await_ready() noexcept { return true; }
+      void await_resume() noexcept {}
+      void await_suspend(coroutine_handle<> /*unused*/) {}
+    };
+    return awaiter{};
+  }
+  auto final_suspend()
+  {
+    struct awaiter
+    {
+      bool await_ready() noexcept { return false; }
+      void await_resume() noexcept {}
+      void await_suspend(coroutine_handle<io_awaitable_promise_type> self)
+      {
+        if(self.promise().continuation)
+        {
+          return self.promise().continuation.resume();
+        }
+      }
+    };
+    return awaiter{};
+  }
+};
+
+/*! \brief An i/o awaitable type, where the operation is attempted immediately,
+and if it can be completed immediately without blocking then the awaitable is returned ready.
+If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
+If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
+i/o completes.
+*/
+template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable
+{
+public:
+  using promise_type = io_awaitable_promise_type<io_awaitable, use_atomic>;
+
+private:
+  using container_type = Cont;
+  union {
+    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
+    typename io_context::template io_result<container_type> _immediate_result;
+  };
+  coroutine_handle<promise_type> _h;
+
+public:
+  io_awaitable(io_awaitable &&o) noexcept
+      : _h(static_cast<coroutine_handle<promise_type> &&>(o._h))
+  {
+    o._h = nullptr;
+    if(!_h)
+    {
+      new(&_immediate_result) container_type(static_cast<typename io_context::template io_result<container_type> &&>(o._immediate_result));
+    }
+  }
+  io_awaitable(const io_awaitable &o) = delete;
+  io_awaitable &operator=(io_awaitable &&) = delete;  // as per P1056
+  io_awaitable &operator=(const io_awaitable &) = delete;
+  ~io_awaitable()
+  {
+    if(_h)
+    {
+      _h.destroy();
+    }
+    else
+    {
+      _immediate_result.~io_result<container_type>();
+    }
+  }
+
+  // Construct an awaitable set later by its promise
+  explicit io_awaitable(promise_type &p)
+      : _h(coroutine_handle<promise_type>::from_promise(p))
+  {
+  }
+  // Construct an awaitable which has an immediate result
+  io_awaitable(typename io_context::template io_result<container_type> &&c)
+      : _immediate_result(static_cast<typename io_context::template io_result<container_type> &&>(c))
+  {
+  }
+  bool await_ready() noexcept { return !_h || _h.promise().result_set.load(std::memory_order_acquire); }
+  typename io_context::template io_result<container_type> await_resume()
+  {
+    if(!_h)
+    {
+      return static_cast<typename io_context::template io_result<container_type> &&>(_immediate_result);
+    }
+    assert(_h.promise().result_set.load(std::memory_order_acquire));
+    if(!_h.promise().result_set.load(std::memory_order_acquire))
+    {
+      std::terminate();
+    }
+    return static_cast<typename io_context::template io_result<container_type> &&>(_h.promise().result);
+  }
+  void await_suspend(coroutine_handle<> cont)
+  {
+    _h.promise().continuation = cont;
+    _h.resume();
+  }
+};
+#endif
 
 // BEGIN make_free_functions.py
 // END make_free_functions.py
