@@ -433,7 +433,7 @@ public:
           return &next;
         }
       };
-      _post(detail::make_function_ptr<void *(void *)>(_{std::forward<U>(f), function_ptr<void(void *)>()}));
+      _post(make_function_ptr<void *(void *)>(_{std::forward<U>(f), function_ptr<void(void *)>()}));
       return success();
     }
     catch(...)
@@ -496,22 +496,27 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   using awaitable_type = Awaitable;
   using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
   using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
-  union {
+  union result_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-    container_type result;
-  };
+    container_type value;
+    result_t() {}
+    ~result_t() {}
+  } result;
   result_set_type result_set{false};
   uint8_t extra_in_use{0};
   coroutine_handle<> continuation;
   native_handle_type nativeh;
   typename io_context::template io_request<typename Awaitable::container_type> reqs{};
   deadline d{};
-  union {
+  union extra_t {
+    OUTCOME_V2_NAMESPACE::detail::empty_type _default2{};
 #ifdef _WIN32
     OVERLAPPED ols[64];
 #else
-    function_ptr<container_type(io_awaitable_promise_type &p)> erased_op;  // used by the epoll implementation to retry the operation
+    function_ptr<container_type(io_awaitable_promise_type &p), 2 * sizeof(void *)> erased_op;  // used by the epoll implementation to retry the operation
 #endif
+    extra_t() {}
+    ~extra_t() {}
   } extra;
 
   // Constructor used by coroutines
@@ -525,7 +530,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   }
   io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
   io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
-      : result_set(o.result_set.load())
+      : result_set(o.result_set.load(std::memory_order_relaxed))
       , extra_in_use(o.extra_in_use)
       , continuation(o.continuation)
       , nativeh(o.nativeh)
@@ -534,7 +539,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   {
     if(result_set.load(std::memory_order_acquire))
     {
-      new(&result) container_type(static_cast<container_type &&>(o.result));
+      new(&result.value) container_type(static_cast<container_type &&>(o.result.value));
     }
     o.continuation = {};
     if(1 == extra_in_use)
@@ -542,7 +547,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
 #ifdef _WIN32
       memcpy(ols, o.ols, sizeof(ols));
 #else
-      new(&extra.erased_op) function_ptr<container_type(io_awaitable_promise_type * p)>(std::move(o.erased_op));
+      new(&extra.erased_op) function_ptr<container_type(io_awaitable_promise_type & p), 2 * sizeof(void *)>(std::move(o.extra.erased_op));
 #endif
     }
   }
@@ -552,12 +557,12 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   {
     if(result_set.load(std::memory_order_acquire))
     {
-      result.~container_type();
+      result.value.~container_type();
     }
 #ifndef _WIN32
     if(1 == extra_in_use)
     {
-      extra.erased_op.~function_ptr<container_type(io_awaitable_promise_type * p)>();
+      extra.erased_op.~function_ptr<container_type(io_awaitable_promise_type & p), 2 * sizeof(void *)>();
     }
 #endif
   }
@@ -567,9 +572,9 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     assert(!result_set.load(std::memory_order_acquire));
     if(result_set.load(std::memory_order_acquire))
     {
-      result.~container_type();
+      result.value.~container_type();
     }
-    new(&result) container_type(static_cast<container_type &&>(value));
+    new(&result.value) container_type(static_cast<container_type &&>(value));
     result_set.store(true, std::memory_order_release);
   }
   void return_value(const container_type &value)
@@ -577,9 +582,9 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     assert(!result_set.load(std::memory_order_acquire));
     if(result_set.load(std::memory_order_acquire))
     {
-      result.~container_type();
+      result.value.~container_type();
     }
-    new(&result) container_type(value);
+    new(&result.value) container_type(value);
     result_set.store(true, std::memory_order_release);
   }
   void unhandled_exception()
@@ -587,15 +592,15 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     assert(!result_set.load(std::memory_order_acquire));
     if(result_set.load(std::memory_order_acquire))
     {
-      result.~container_type();
+      result.value.~container_type();
     }
 #ifdef __cpp_exceptions
     auto e = std::current_exception();
     auto ec = OUTCOME_V2_NAMESPACE::awaitables::detail::error_from_exception(static_cast<decltype(e) &&>(e), {});
     // Try to set error code first
-    if(!OUTCOME_V2_NAMESPACE::awaitables::detail::error_is_set(ec) || !OUTCOME_V2_NAMESPACE::awaitables::detail::try_set_error(ec, &result))
+    if(!OUTCOME_V2_NAMESPACE::awaitables::detail::error_is_set(ec) || !OUTCOME_V2_NAMESPACE::awaitables::detail::try_set_error(ec, &result.value))
     {
-      OUTCOME_V2_NAMESPACE::awaitables::detail::set_or_rethrow(e, &result);
+      OUTCOME_V2_NAMESPACE::awaitables::detail::set_or_rethrow(e, &result.value);
     }
 #else
     std::terminate();
@@ -638,6 +643,8 @@ i/o completes.
 */
 template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable
 {
+  template <class Awaitable, bool use_atomic_> friend struct io_awaitable_promise_type;
+
 public:
   using promise_type = io_awaitable_promise_type<io_awaitable, use_atomic>;
 
@@ -656,7 +663,7 @@ public:
     o._h = nullptr;
     if(!_h)
     {
-      new(&_immediate_result) container_type(static_cast<typename io_context::template io_result<container_type> &&>(o._immediate_result));
+      new(&_immediate_result) typename io_context::template io_result<container_type>(static_cast<typename io_context::template io_result<container_type> &&>(o._immediate_result));
     }
   }
   io_awaitable(const io_awaitable &o) = delete;
@@ -680,8 +687,10 @@ public:
   {
   }
   // Construct an awaitable which has an immediate result
-  io_awaitable(typename io_context::template io_result<container_type> &&c)
-      : _immediate_result(static_cast<typename io_context::template io_result<container_type> &&>(c))
+  LLFIO_TEMPLATE(class T)
+  LLFIO_TREQUIRES(LLFIO_TPRED(std::is_constructible<typename io_context::template io_result<container_type>, T>::value))
+  io_awaitable(T &&c)
+      : _immediate_result(static_cast<T &&>(c))
   {
   }
   bool await_ready() noexcept { return !_h || _h.promise().result_set.load(std::memory_order_acquire); }
@@ -696,7 +705,7 @@ public:
     {
       std::terminate();
     }
-    return static_cast<typename io_context::template io_result<container_type> &&>(_h.promise().result);
+    return static_cast<typename io_context::template io_result<container_type> &&>(_h.promise().result.value);
   }
   void await_suspend(coroutine_handle<> cont)
   {

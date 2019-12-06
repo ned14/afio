@@ -382,15 +382,21 @@ io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> 
         {
           // Have my i/o context suspend my caller until either some data for read turns up, or my deadline expires
           using promise_type = io_handle::co_read_awaitable<false>::promise_type;
-          using callable_type = io_result<buffers_type>(promise_type &);
+          using result_type = io_result<buffers_type>;
+          using callable_type = result_type(promise_type &);
           promise_type p(this, reqs, d);
-          new(&p.extra.erased_op) function_ptr<callable_type>(make_function_ptr_nothrow < callable_type>([](promise_type &p) {
-            // Temporarily wrap the native handle
-            io_handle wrapper(p.nativeh);
-            auto ret = wrapper.read(p.reqs, std::chrono::seconds(0));
-            wrapper.release();
-            return ret;
-          }));
+          struct _
+          {
+            result_type operator()(promise_type& p) const noexcept {
+              // Temporarily wrap the native handle
+              io_handle wrapper(p.nativeh);
+              auto ret = wrapper.read(p.reqs, std::chrono::seconds(0));
+              wrapper.release();
+              return ret;
+            }
+          };
+          static_assert(std::is_nothrow_move_constructible<_>::value, "boo");
+          new(&p.extra.erased_op) function_ptr<callable_type, 2 * sizeof(void *)>(make_function_ptr_nothrow<callable_type>(_()));
           p.extra_in_use = 1;
           return multiplexer()->_run_until_read_ready(std::move(p));
         }
@@ -475,15 +481,21 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
         {
           // Have my i/o context suspend my caller until either some space for write turns up, or my deadline expires
           using promise_type = io_handle::co_write_awaitable<false>::promise_type;
-          using callable_type = io_result<const_buffers_type>(promise_type &);
+          using result_type =io_result<const_buffers_type>;
+          using callable_type = result_type(promise_type &);
           promise_type p(this, reqs, d);
-          new(&p.extra.erased_op) function_ptr<callable_type>(make_function_ptr_nothrow < callable_type>([](promise_type &p) {
-            // Temporarily wrap the native handle
-            io_handle wrapper(p.nativeh);
-            auto ret = wrapper.write(p.reqs, std::chrono::seconds(0));
-            wrapper.release();
-            return ret;
-          }));
+          struct _
+          {
+            result_type operator()(promise_type &p) const noexcept
+            {
+              // Temporarily wrap the native handle
+              io_handle wrapper(p.nativeh);
+              auto ret = wrapper.write(p.reqs, std::chrono::seconds(0));
+              wrapper.release();
+              return ret;
+            }
+          };
+          new(&p.extra.erased_op) function_ptr<callable_type, 2 * sizeof(void *)>(make_function_ptr_nothrow<callable_type>(_()));
           p.extra_in_use = 1;
           return multiplexer()->_run_until_write_ready(std::move(p));
         }
