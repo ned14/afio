@@ -327,7 +327,6 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
   return {reqs.buffers};
 }
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
 io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
@@ -384,7 +383,7 @@ io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> 
           using promise_type = io_handle::co_read_awaitable<false>::promise_type;
           using result_type = io_result<buffers_type>;
           using callable_type = result_type(promise_type &);
-          promise_type p(this, reqs, d);
+          promise_type p(this, reqs);
           struct _
           {
             result_type operator()(promise_type& p) const noexcept {
@@ -398,7 +397,7 @@ io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> 
           static_assert(std::is_nothrow_move_constructible<_>::value, "boo");
           new(&p.extra.erased_op) function_ptr<callable_type, 2 * sizeof(void *)>(make_function_ptr_nothrow<callable_type>(_()));
           p.extra_in_use = 1;
-          return multiplexer()->_run_until_read_ready(std::move(p));
+          return multiplexer()->_submit_read(std::move(p), d);
         }
         LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
@@ -483,7 +482,7 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
           using promise_type = io_handle::co_write_awaitable<false>::promise_type;
           using result_type =io_result<const_buffers_type>;
           using callable_type = result_type(promise_type &);
-          promise_type p(this, reqs, d);
+          promise_type p(this, reqs);
           struct _
           {
             result_type operator()(promise_type &p) const noexcept
@@ -497,7 +496,7 @@ io_handle::co_write_awaitable<false> io_handle::co_write(io_request<const_buffer
           };
           new(&p.extra.erased_op) function_ptr<callable_type, 2 * sizeof(void *)>(make_function_ptr_nothrow<callable_type>(_()));
           p.extra_in_use = 1;
-          return multiplexer()->_run_until_write_ready(std::move(p));
+          return multiplexer()->_submit_write(std::move(p), d);
         }
         LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
       }
@@ -532,6 +531,5 @@ io_handle::co_barrier_awaitable<false> io_handle::co_barrier(io_request<const_bu
   }
   return errc::operation_not_supported;
 }
-#endif
 
 LLFIO_V2_NAMESPACE_END

@@ -117,11 +117,6 @@ public:
   */
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC size_t max_buffers() const noexcept;
 
-  /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null,
-  then this handle has not been registered with an i/o context yet.
-  */
-  io_context *multiplexer() const noexcept { return this->_ctx; }
-
   /*! \brief Sets the i/o context this handle will use to multiplex i/o.
 
   This function will always fail if `.is_multiplexable()` is false for this handle.
@@ -267,7 +262,6 @@ public:
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
   //! \brief The type for a read i/o awaitable
   template <bool use_atomic> using co_read_awaitable = typename io_context::template _co_read_awaitable<use_atomic>;
   //! \brief The type for a write i/o awaitable
@@ -325,7 +319,6 @@ public:
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_barrier_awaitable<false> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
-#endif
 };
 
 

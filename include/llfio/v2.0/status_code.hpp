@@ -59,11 +59,9 @@ as that (a) enables safe header only LLFIO on Windows (b) produces better codege
 #include "outcome/try.hpp"
 // Bring in status code utility
 #include "outcome/experimental/status-code/include/system_code_from_exception.hpp"
-#if __cpp_coroutines
 #include "outcome/experimental/coroutine_support.hpp"
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+#if !defined(LLFIO_ENABLE_COROUTINES) && defined(OUTCOME_FOUND_COROUTINE_HEADER)
 #define LLFIO_ENABLE_COROUTINES 1
-#endif
 #endif
 
 LLFIO_V2_NAMESPACE_BEGIN
@@ -294,11 +292,9 @@ LLFIO_V2_NAMESPACE_END
 #include "outcome/result.hpp"
 #include "outcome/try.hpp"
 #include "outcome/utils.hpp"
-#if __cpp_coroutines
 #include "outcome/coroutine_support.hpp"
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+#if !defined(LLFIO_ENABLE_COROUTINES) && defined(OUTCOME_FOUND_COROUTINE_HEADER)
 #define LLFIO_ENABLE_COROUTINES 1
-#endif
 #endif
 
 LLFIO_V2_NAMESPACE_BEGIN

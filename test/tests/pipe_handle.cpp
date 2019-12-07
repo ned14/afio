@@ -95,7 +95,7 @@ static inline void TestNonBlockingPipeHandle()
 static inline void TestCoroutinedPipeHandle()
 {
   namespace llfio = LLFIO_V2_NAMESPACE;
-  auto coro = []() -> llfio::io_handle::eager_awaitable<void> {
+  auto coro = []() -> OUTCOME_V2_NAMESPACE::awaitables::eager<void> {
     llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
     llfio::byte buffer[64];
     llfio::pipe_handle::buffer_type buffer1{buffer, 64}, buffer2{buffer, 64};
@@ -131,6 +131,7 @@ static inline void TestCoroutinedPipeHandle()
   auto a = coro();  // launch the coroutine
   while(!a.await_ready())
   {
+    std::cout << "Coroutine is not ready, resuming it ..." << std::endl;
     a.await_suspend({});  // pump it every time it suspends
   }
   a.await_resume();  // fetch its result

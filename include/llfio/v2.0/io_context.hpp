@@ -36,10 +36,8 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
 class io_handle;
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
 template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type;
 template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable;
-#endif
 
 /*! \class io_context
 \brief An i/o multiplexer context.
@@ -134,6 +132,8 @@ non-seekable devices are currently supported.
 class LLFIO_DECL io_context
 {
   friend class io_handle;
+  template <class Cont, bool use_atomic> friend class io_awaitable;
+  size_t _maximum_pending_io{64};
 
 protected:
   constexpr io_context() {}
@@ -389,6 +389,16 @@ public:
   io_context &operator=(const io_context &) = delete;
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC ~io_context() {}
 
+  //! \brief Returns the maximum number of inflight i/o there can be.
+  size_t maximum_pending_io() const noexcept { return _maximum_pending_io; }
+
+  /*! \brief Sets the maximum number of inflight i/o there can be. This is the number of
+  i/o either pending completion, or completed but whose result has not yet been retrieved.
+  Setting it to zero sets the default for this i/o context implementation, which for all
+  i/o contexts implemented by LLFIO is 64.
+  */
+  void set_maximum_pending_io(size_t no) noexcept { _maximum_pending_io = (0==no) ? 64 : no;}
+
   /*! Checks if any items have been posted, or if any i/o scheduled has completed, if so
   either executes the posted item, or resumes any coroutines suspended pending the
   completion of the i/o. Returns true if more work remains and we just handled an i/o or post;
@@ -442,7 +452,6 @@ public:
     }
   }
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
   struct co_post_self_to_context_awaitable
   {
     io_context *ctx;
@@ -453,10 +462,12 @@ public:
     }
 
     bool await_ready() { return false; }
+#if LLFIO_ENABLE_COROUTINES
     void await_suspend(coroutine_handle<> co)
     {
       ctx->post([co = co]() mutable { co.resume(); }).value();
     }
+#endif
     void await_resume() {}
   };
   /*! \brief Return an awaitable suspending execution of this coroutine on the current kernel thread,
@@ -474,10 +485,11 @@ protected:
   template <bool use_atomic> using _co_write_awaitable_promise_type = io_awaitable_promise_type<_co_write_awaitable<use_atomic>, use_atomic>;
   template <bool use_atomic> using _co_barrier_awaitable_promise_type = io_awaitable_promise_type<_co_barrier_awaitable<use_atomic>, use_atomic>;
 
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _run_until_read_ready(_co_read_awaitable_promise_type<false> &&p) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _run_until_write_ready(_co_write_awaitable_promise_type<false> &&p) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _run_until_barrier_ready(_co_barrier_awaitable_promise_type<false> &&p) noexcept = 0;
-#endif
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _submit_read(_co_read_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _submit_write(_co_write_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _submit_barrier(_co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _cancel_io(void *p) noexcept = 0;
 };
 
 //! \brief Thread local settings
@@ -489,13 +501,12 @@ namespace this_thread
   LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_context *ctx) noexcept;
 }  // namespace this_thread
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
 //! \brief The promise type for an i/o awaitable
 template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
 {
   using awaitable_type = Awaitable;
   using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
-  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::fake_atomic<bool>>;
+  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<bool>>;
   union result_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
     container_type value;
@@ -504,10 +515,10 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   } result;
   result_set_type result_set{false};
   uint8_t extra_in_use{0};
-  coroutine_handle<> continuation;
+  io_context *ctx{nullptr};
+  void *internal_reference{nullptr};
   native_handle_type nativeh;
   typename io_context::template io_request<typename Awaitable::container_type> reqs{};
-  deadline d{};
   union extra_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default2{};
 #ifdef _WIN32
@@ -522,26 +533,26 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   // Constructor used by coroutines
   io_awaitable_promise_type() {}
   // Constructor used by co_read|co_write|co_barrier
-  io_awaitable_promise_type(handle *_h, typename io_context::template io_request<typename Awaitable::container_type> _reqs, deadline _d)
-      : nativeh(_h->native_handle())
+  io_awaitable_promise_type(handle *_h, typename io_context::template io_request<typename Awaitable::container_type> _reqs)
+      : ctx(_h->multiplexer())
+      , nativeh(_h->native_handle())
       , reqs(_reqs)
-      , d(_d)
   {
   }
   io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
   io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
       : result_set(o.result_set.load(std::memory_order_relaxed))
       , extra_in_use(o.extra_in_use)
-      , continuation(o.continuation)
+      , ctx(o.ctx)
+      , internal_reference(o.internal_reference)
       , nativeh(o.nativeh)
       , reqs(o.reqs)
-      , d(o.d)
   {
     if(result_set.load(std::memory_order_acquire))
     {
       new(&result.value) container_type(static_cast<container_type &&>(o.result.value));
     }
-    o.continuation = {};
+    o.ctx = nullptr;
     if(1 == extra_in_use)
     {
 #ifdef _WIN32
@@ -566,7 +577,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     }
 #endif
   }
-  auto get_return_object() { return Awaitable{*this}; }
+  auto get_return_object() { return Awaitable{this}; }
   void return_value(container_type &&value)
   {
     assert(!result_set.load(std::memory_order_acquire));
@@ -613,7 +624,13 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     {
       bool await_ready() noexcept { return true; }
       void await_resume() noexcept {}
-      void await_suspend(coroutine_handle<> /*unused*/) {}
+      void await_suspend(
+#if LLFIO_ENABLE_COROUTINES
+      coroutine_handle<> /*unused*/
+#endif
+      )
+      {
+      }
     };
     return awaiter{};
   }
@@ -621,14 +638,14 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   {
     struct awaiter
     {
-      bool await_ready() noexcept { return false; }
+      bool await_ready() noexcept { return true; }
       void await_resume() noexcept {}
-      void await_suspend(coroutine_handle<io_awaitable_promise_type> self)
+      void await_suspend(
+#if LLFIO_ENABLE_COROUTINES
+      coroutine_handle<> /*unused*/
+#endif
+      )
       {
-        if(self.promise().continuation)
-        {
-          return self.promise().continuation.resume();
-        }
       }
     };
     return awaiter{};
@@ -654,14 +671,14 @@ private:
     OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
     typename io_context::template io_result<container_type> _immediate_result;
   };
-  coroutine_handle<promise_type> _h;
+  promise_type *_p{nullptr};
 
 public:
   io_awaitable(io_awaitable &&o) noexcept
-      : _h(static_cast<coroutine_handle<promise_type> &&>(o._h))
+      : _p(o._p)
   {
-    o._h = nullptr;
-    if(!_h)
+    o._p = nullptr;
+    if(_p == nullptr)
     {
       new(&_immediate_result) typename io_context::template io_result<container_type>(static_cast<typename io_context::template io_result<container_type> &&>(o._immediate_result));
     }
@@ -671,19 +688,23 @@ public:
   io_awaitable &operator=(const io_awaitable &) = delete;
   ~io_awaitable()
   {
-    if(_h)
+    if(_p == nullptr)
     {
-      _h.destroy();
+      _immediate_result.~io_result<container_type>();
     }
     else
     {
-      _immediate_result.~io_result<container_type>();
+      auto r = _p->ctx->_cancel_io(_p->internal_reference);
+      if(!r)
+      {
+        abort();  // should never happen as promise already satisfied
+      }
     }
   }
 
   // Construct an awaitable set later by its promise
-  explicit io_awaitable(promise_type &p)
-      : _h(coroutine_handle<promise_type>::from_promise(p))
+  explicit io_awaitable(promise_type *p)
+      : _p(p)
   {
   }
   // Construct an awaitable which has an immediate result
@@ -693,27 +714,51 @@ public:
       : _immediate_result(static_cast<T &&>(c))
   {
   }
-  bool await_ready() noexcept { return !_h || _h.promise().result_set.load(std::memory_order_acquire); }
+  bool await_ready() noexcept { return _p == nullptr || _p->result_set.load(std::memory_order_acquire); }
   typename io_context::template io_result<container_type> await_resume()
   {
-    if(!_h)
+    if(_p == nullptr)
     {
       return static_cast<typename io_context::template io_result<container_type> &&>(_immediate_result);
     }
-    assert(_h.promise().result_set.load(std::memory_order_acquire));
-    if(!_h.promise().result_set.load(std::memory_order_acquire))
+    assert(_p->result_set.load(std::memory_order_acquire));
+    if(!_p->result_set.load(std::memory_order_acquire))
     {
       std::terminate();
     }
-    return static_cast<typename io_context::template io_result<container_type> &&>(_h.promise().result.value);
+    // Release my promise as early as possible
+    new(&_immediate_result) typename io_context::template io_result<container_type>(static_cast<typename io_context::template io_result<container_type> &&>(_p->result.value));
+    auto r = _p->ctx->_cancel_io(_p->internal_reference);
+    if(!r)
+    {
+      abort();  // should never happen as promise already satisfied
+    }
+    _p = nullptr;
+    return static_cast<typename io_context::template io_result<container_type> &&>(_immediate_result);
   }
-  void await_suspend(coroutine_handle<> cont)
+  void await_suspend(
+#if LLFIO_ENABLE_COROUTINES
+  coroutine_handle<> /*unused*/
+#endif
+  )
   {
-    _h.promise().continuation = cont;
-    _h.resume();
+    // Pump the i/o context until my promise gets set
+    do
+    {
+      auto r = _p->ctx->run();
+      if(!r)
+      {
+        auto r2 = _p->ctx->_cancel_io(_p->internal_reference);
+        if(!r2)
+        {
+          abort();
+        }
+        _p = nullptr;
+        new(&_immediate_result) typename io_context::template io_result<container_type>(r.error());
+      }
+    } while(!await_ready());
   }
 };
-#endif
 
 // BEGIN make_free_functions.py
 // END make_free_functions.py

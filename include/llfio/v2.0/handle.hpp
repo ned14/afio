@@ -250,6 +250,11 @@ public:
     o = std::move(temp);
   }
 
+  /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null,
+  then this handle has not been registered with an i/o context yet.
+  */
+  io_context *multiplexer() const noexcept { return this->_ctx; }
+
   /*! Returns the current path of the open handle as said by the operating system. Note
   that you are NOT guaranteed that any path refreshed bears any resemblance to the original,
   some operating systems will return some different path which still reaches the same inode
