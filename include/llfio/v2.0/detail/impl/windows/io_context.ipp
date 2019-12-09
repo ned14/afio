@@ -26,9 +26,9 @@ Distributed under the Boost Software License, Version 1.0.
 
 #include "import.hpp"
 
-#ifdef __linux__
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
+#ifndef _WIN32
+#error This implementation file is for Microsoft Windows
+#endif
 
 #include <chrono>
 #include <map>
@@ -36,7 +36,7 @@ Distributed under the Boost Software License, Version 1.0.
 
 LLFIO_V2_NAMESPACE_BEGIN
 
-template <bool threadsafe> class linux_epoll_impl final : public io_context_impl<threadsafe>
+template <bool threadsafe> class win_iocp_impl final : public io_context_impl<threadsafe>
 {
   using _base = io_context_impl<threadsafe>;
   using _lock_guard = typename _base::_lock_guard;
@@ -56,7 +56,6 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
       write,
       barrier
     };
-    struct epoll_event ev;
     struct io_outstanding_t
     {
       io_outstanding_t *prev{nullptr}, *next{nullptr};
@@ -74,18 +73,13 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
     } * next_io_outstanding{nullptr}, *last_io_outstanding{nullptr}, *free_io_outstanding{nullptr};
 
     registered_handle() = default;
-    explicit registered_handle(struct epoll_event _ev)
-        : ev(_ev)
-    {
-    }
   };
-  using _registered_handles_map_type = std::unordered_map<int, registered_handle>;
+  using _registered_handles_map_type = std::unordered_map<HANDLE, registered_handle>;
   _registered_handles_map_type _registered_handles;
-  int _post_eventfd{-1};
   std::multimap<std::chrono::steady_clock::time_point, typename registered_handle::io_outstanding_t *> _durations;
   std::multimap<std::chrono::system_clock::time_point, typename registered_handle::io_outstanding_t *> _absolutes;
 
-  void _remove_pending_io(typename _registered_handles_map_type::iterator it, typename registered_handle::io_outstanding_t *i)
+  void _remove_pending_io(typename _registered_handles_map_type::value_type *rh, typename registered_handle::io_outstanding_t *i)
   {
     if(i->next == nullptr && i->prev == nullptr)
     {
@@ -151,74 +145,38 @@ template <bool threadsafe> class linux_epoll_impl final : public io_context_impl
   }
 
 public:
-  result<void> init(size_t /*unused*/)
+  result<void> init(size_t threads)
   {
-    this->_v.fd = epoll_create1(EPOLL_CLOEXEC);
-    if(-1 == this->_v.fd)
+    this->_v.h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, threads);
+    if(nullptr == this->_v.h)
     {
-      return posix_error();
-    }
-    _post_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if(-1 == _post_eventfd)
-    {
-      return posix_error();
-    }
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.data.fd = _post_eventfd;
-    ev.events = EPOLLIN;
-    if(-1 == epoll_ctl(this->_v.fd, EPOLL_CTL_ADD, _post_eventfd, &ev))
-    {
-      return posix_error();
+      return win32_error();
     }
     return success();
   }
-  virtual ~linux_epoll_impl()
+  virtual ~win_iocp_impl()
   {
     this->_lock.lock();
     if(!_registered_handles.empty())
     {
-      LLFIO_LOG_FATAL(nullptr, "linux_epoll_impl::~linux_epoll_impl() called with registered i/o handles");
+      LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with registered i/o handles");
       abort();
     }
-    (void) ::close(_post_eventfd);
-    (void) ::close(this->_v.fd);
+    (void) CloseHandle(this->_v.h);
   }
 
   virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
   {
     _base::_post(std::move(f));
-    // Poke epoll() to wake
-    uint64_t v = 1;
-    (void) ::write(_post_eventfd, &v, sizeof(uint64_t));
+    // Poke IOCP to wake
+    PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
   }
 
-  virtual result<void> _register_io_handle(handle *h) noexcept override final
+  virtual result<void *> _register_io_handle(handle *h) noexcept override final
   {
     try
     {
-      struct epoll_event ev;
-      memset(&ev, 0, sizeof(ev));
-      ev.data.fd = h->native_handle().fd;
-      ev.events = EPOLLHUP | EPOLLERR | EPOLLET;  // edge triggered
-      if(h->is_readable())
-      {
-        ev.events |= EPOLLIN;
-      }
-      if(h->is_writable())
-      {
-        ev.events |= EPOLLOUT;
-      }
-      if(threadsafe)
-      {
-        ev.events |= EPOLLEXCLUSIVE;
-      }
-      // Begin watching this fd for changes
-      if(-1 == epoll_ctl(this->_v.fd, EPOLL_CTL_ADD, h->native_handle().fd, &ev))
-      {
-        return posix_error();
-      }
-      registered_handle r(ev);
+      registered_handle r;
       // Preallocate i/o structures
       for(size_t n = 0; n < this->maximum_pending_io(); n++)
       {
@@ -227,8 +185,13 @@ public:
         r.free_io_outstanding = i;
       }
       _lock_guard g(this->_lock);
-      _registered_handles.insert({h->native_handle().fd, std::move(r)});
-      return success();
+      auto it = _registered_handles.insert({h->native_handle().h, std::move(r)});
+      if(nullptr == CreateIoCompletionPort(h->native_handle().h, this->_v.h, &(*it), 0))
+      {
+        _registered_handles.erase(it);
+        return win32_error();
+      }
+      return it->second.ols;
     }
     catch(...)
     {
@@ -242,7 +205,7 @@ public:
       registered_handle r;
       {
         _lock_guard g(this->_lock);
-        auto it = _registered_handles.find(h->native_handle().fd);
+        auto it = _registered_handles.find(h->native_handle().h);
         if(it == _registered_handles.end())
         {
           abort();
@@ -253,10 +216,6 @@ public:
         }
         r = std::move(it->second);
         _registered_handles.erase(it);
-      }
-      if(-1 == epoll_ctl(this->_v.fd, EPOLL_CTL_DEL, h->native_handle().fd, &r.ev))
-      {
-        return posix_error();
       }
       assert(r.next_io_outstanding == nullptr);
       while(r.free_io_outstanding != nullptr)
@@ -274,18 +233,17 @@ public:
   }
   virtual result<size_t> run(deadline d = deadline()) noexcept override final
   {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
     LLFIO_LOG_FUNCTION_CALL(this);
-    if(this->_execute_posted_items())
-    {
-      return 1;
-    }
-    LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
+    LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
     for(;;)
     {
-      struct epoll_event ev;
-      memset(&ev, 0, sizeof(ev));
-      LLFIO_POSIX_DEADLINE_TO_SLEEP_LOOP(d);
-      int mstimeout = (timeout == nullptr) ? -1 : (timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000LL);
+      if(this->_execute_posted_items())
+      {
+        return 1;
+      }
+      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);
       _lock_guard g(this->_lock);
       std::chrono::steady_clock::time_point deadline_duration;
       std::chrono::system_clock::time_point deadline_absolute;
@@ -294,27 +252,29 @@ public:
       if(!_durations.empty())
       {
         deadline_duration = _durations.begin()->first;
-        auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_duration - std::chrono::steady_clock::now()).count();
+        auto togo = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline_duration - std::chrono::steady_clock::now()).count();
         if(togo <= 0)
         {
           resume_timed_out = _durations.begin()->second;
         }
-        else if(-1 == mstimeout || togo < mstimeout)
+        else if(nullptr == timeout || togo.count() / -100 > timeout->QuadPart)
         {
-          mstimeout = togo;
+          timeout = &_timeout;
+          timeout->QuadPart = togo.count() / -100;
         }
       }
       if(!_absolutes.empty())
       {
         deadline_absolute = _absolutes.begin()->first;
-        auto togo = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_absolute - std::chrono::system_clock::now()).count();
+        auto togo = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline_absolute - std::chrono::system_clock::now()).count();
         if(togo <= 0)
         {
           resume_timed_out = _absolutes.begin()->second;
         }
-        else if(-1 == mstimeout || togo < mstimeout)
+        else if(nullptr == timeout || togo.count() < -timeout->QuadPart)
         {
-          mstimeout = togo;
+          timeout = &_timeout;
+          timeout->QuadPart = windows_nt_kernel::from_timepoint(deadline_absolute);
         }
       }
       // Set timed out
@@ -350,76 +310,58 @@ public:
         }
       }
       g.unlock();
-      int ret = epoll_wait(this->_v.fd, &ev, 1, mstimeout);
-      if(-1 == ret)
-      {
-        return posix_error();
-      }
-      if(ret == 0)
+      OVERLAPPED_ENTRY entries[64];
+      ULONG filled = 0;
+      // Use this instead of GetQueuedCompletionStatusEx() as this implements absolute timeouts
+      NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, sizeof(entries)/sizeof(entries[0]), &filled, timeout, false));
+      if(STATUS_TIMEOUT == ntstat)
       {
         // If the supplied deadline has passed, return errc::timed_out
         LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
-      }
-      if(ret > 0 && ev.data.fd == _post_eventfd)
-      {
-        if(this->_execute_posted_items())
-        {
-          return 1;
-        }
         continue;
       }
-      g.lock();
-      if(ret > 0)
+      if(ntstat < 0)
       {
-        auto it = _registered_handles.find(ev.data.fd);
-        if(it == _registered_handles.end())
+        return ntkernel_error();
+      }
+      g.lock();
+      size_t post_wakeups = 0;
+      for(ULONG n = 0; n < filled; n++)
+      {
+        // Get the direct pointer to the HANDLE's tracked state
+        auto *rh = (typename _registered_handles_map_type::value_type *) entries[n].lpCompletionKey;
+        // If it's null, this is a post() wakeup
+        if(rh == nullptr)
         {
+          ++post_wakeups;
+          continue;
+        }
+        // The hEvent member is the io_outstanding_t used
+        auto *i = (typename registered_handle::io_outstanding_t *) rh->lpOverlapped->hEvent;
+        switch(i->kind)
+        {
+        default:
           abort();
+        case registered_handle::read:
+          auto result = calculate_result(i->read_promise, entries[n].dwNumberOfBytesTransferred);
+          _remove_pending_io(rh, i);
+          i->read_promise.return_value(std::move(result));
+          break;
+        case registered_handle::write:
+          auto result = calculate_result(i->write_promise, entries[n].dwNumberOfBytesTransferred);
+          _remove_pending_io(rh, i);
+          i->write_promise.return_value(std::move(result));
+          break;
+        case registered_handle::barrier:
+          auto result = calculate_result(i->barrier_promise, entries[n].dwNumberOfBytesTransferred);
+          _remove_pending_io(rh, i);
+          i->barrier_promise.return_value(std::move(result));
+          break;
         }
-        // Resume the earliest pending i/o matching read/write
-        for(typename registered_handle::io_outstanding_t *i = it->second.next_io_outstanding; i != nullptr; i = i->next)
-        {
-          // Does this i/o match? If it's an error, wake the earliest irrespective.
-          switch(i->kind)
-          {
-          default:
-            abort();
-          case registered_handle::read:
-            if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::read && (ev.events & EPOLLIN) != 0))
-            {
-              // Reattempt the i/o
-              assert(i->read_promise.extra_in_use == 1);
-              g.unlock();
-              auto result = i->read_promise.extra.erased_op(i->read_promise);
-              g.lock();
-              if(result || result.error() != errc::timed_out)
-              {
-                // Complete with the result
-                _remove_pending_io(it, i);
-                i->read_promise.return_value(std::move(result));
-                return 1;
-              }
-            }
-            break;
-          case registered_handle::write:
-            if((ev.events & (EPOLLHUP | EPOLLERR)) != 0 || (i->kind == registered_handle::write && (ev.events & EPOLLOUT) != 0))
-            {
-              // Reattempt the i/o
-              assert(i->write_promise.extra_in_use == 1);
-              g.unlock();
-              auto result = i->write_promise.extra.erased_op(i->write_promise);
-              g.lock();
-              if(result || result.error() != errc::timed_out)
-              {
-                // Complete with the result
-                _remove_pending_io(it, i);
-                i->write_promise.return_value(std::move(result));
-                return 1;
-              }
-            }
-            break;
-          }
-        }
+      }
+      if(filled - post_wakeups > 0)
+      {
+        return filled - post_wakeups;
       }
     }
   }
@@ -537,19 +479,19 @@ public:
   }
 };
 
-LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::linux_epoll(size_t threads) noexcept
+LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::win_iocp(size_t threads) noexcept
 {
   try
   {
     if(threads > 1)
     {
-      auto ret = std::make_unique<linux_epoll_impl<true>>();
+      auto ret = std::make_unique<win_iocp_impl<true>>();
       OUTCOME_TRY(ret->init(threads));
       return ret;
     }
     else
     {
-      auto ret = std::make_unique<linux_epoll_impl<false>>();
+      auto ret = std::make_unique<win_iocp_impl<false>>();
       OUTCOME_TRY(ret->init(threads));
       return ret;
     }
@@ -560,15 +502,4 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::
   }
 }
 
-LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::linux_io_uring() noexcept
-{
-  return errc::not_supported;
-}
-
 LLFIO_V2_NAMESPACE_END
-
-#elif defined(__FreeBSD__) || defined(__APPLE__)
-#error bsd_kqueue i/o context not implemented yet!
-#else
-#error Unknown POSIX platform
-#endif

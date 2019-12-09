@@ -47,14 +47,20 @@ i/o on a single kernel thread. An `io_handle` may use its own i/o
 context set using its `.set_multiplexer()`, or else it will use the
 current thread's i/o context which is set using `this_thread::set_multiplexer()`.
 If never set, `this_thread::multiplexer()` will upon first call create
-an i/o context suitable for the current platform using `io_context::best_available(1)`,
-so in general you can simply start multiplexing i/o immediately without
-having to do any setup, and everything should "just work".
+an i/o context suitable for the current platform using `io_context::best_available(1)`
+and retain it in thread local storage, so in general you can simply
+start multiplexing i/o immediately without having to do any setup, and
+everything should "just work".
 
 For all i/o context implementations, `.post()` is guaranteed to be
 threadsafe. You can use this to post work from other kernel threads
 to be executed by the i/o context on its kernel thread as soon as
 possible.
+
+For most i/o context implementations, no dynamic memory allocations
+occur during i/o. If `threads` is less than or equal to `1`, no
+locking occurs during i/o either unless items from `.post()` were
+processed.
 
 ## Available implementations
 
@@ -63,7 +69,12 @@ varying tradeoffs. Some of the implementations take a `threads`
 parameter. If not `1`, the implementation returned can handle more
 than one thread using the same instance at a time. In this situation,
 i/o completions are delivered to the next available idle thread
-calling `.run()`.
+blocked within `.run()`.
+
+`.run()` returns when i/o completions were processed. You should
+probably therefore run it within a loop. For improved efficiency,
+some of the `.run()` implementations will process many completions
+at a time, and will return the number it processed.
 
 ### Linux
 
@@ -78,14 +89,15 @@ which specific i/o to wait for (and `epoll()` doesn't work on seekable
 devices in any case), the implementation works on a FIFO basis i.e.
 if forty coroutines do forty reads on the same i/o handle, the
 earliest read is the first one resumed when the i/o handle signals
-ready for reads. You can perform up to 64 concurrent i/o's per handle
-in this implementation before an error code comparing equal to
-`errc::resource_unavailable_try_again` will be returned.
+ready for reads. You can perform up to `maximum_pending_io()` concurrent
+i/o's per handle in this implementation before an error code comparing
+equal to `errc::resource_unavailable_try_again` will be returned.
 
 Note that this implementation must perform a dynamic memory allocation per i/o
 if an i/o with a non-zero non-infinite deadline blocks. This is because
 a global ordered list of deadlines must be kept for `epoll()` to efficiently
-detect timeouts.
+detect timeouts. This implementation is only non-allocating if you use
+either zero or infinite deadlines.
 
 - `io_context::linux_io_uring()` returns a Linux io_uring based i/o
 context implementation. As Linux io_uring is fundamentally a single
@@ -123,6 +135,17 @@ non-seekable devices are currently supported.
 i/o context implementation. If `threads` is 1, the implementation
 returned cannot be used by multiple threads (apart from `.post()`).
 
+Be aware that because Windows does not have scatter-gather i/o support
+for some kinds of handle, on those kinds of handle a whole i/o is
+issued per buffer. This can cause `maximum_pending_io()` to be reached
+earlier than on other platforms.
+
+Note that this implementation must perform a dynamic memory allocation per i/o
+if an i/o with a non-zero non-infinite deadline blocks. This is because
+a global ordered list of deadlines must be kept for IOCP to efficiently
+detect timeouts. This implementation is only non-allocating if you use
+either zero or infinite deadlines.
+
 Note that support for asynchronous file i/o is not currently
 implemented for no good reason other than lack of time. Only
 non-seekable devices are currently supported.
@@ -133,13 +156,10 @@ class LLFIO_DECL io_context
 {
   friend class io_handle;
   template <class Cont, bool use_atomic> friend class io_awaitable;
-  size_t _maximum_pending_io{64};
 
 protected:
-  constexpr io_context() {}
-
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _register_io_handle(handle *h) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _deregister_io_handle(handle *h) noexcept = 0;
+  size_t _maximum_pending_io{64};
+  native_handle_type _v;
 
 public:
   using path_type = handle::path_type;
@@ -399,20 +419,41 @@ public:
   */
   void set_maximum_pending_io(size_t no) noexcept { _maximum_pending_io = (0==no) ? 64 : no;}
 
+  //! The native handle used by this i/o context
+  native_handle_type native_handle() const noexcept { return _v; }
+
   /*! Checks if any items have been posted, or if any i/o scheduled has completed, if so
   either executes the posted item, or resumes any coroutines suspended pending the
-  completion of the i/o. Returns true if more work remains and we just handled an i/o or post;
-  false if there is no more work; `errc::timed_out` if the deadline passed.
+  completion of the i/o. Returns the number of items or i/o completed; `errc::timed_out`
+  if the deadline passed.
 
-  \mallocs None in the usual case; if any items posted were executed, there is a dynamic
+  \mallocs None in the usual case; if any items posted were executed, there may be a dynamic
   memory free and a mutex lock/unlock cycle. If the i/o context is threadsafe, there
   are multiple mutex lock/unlock cycles.
   */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<bool> run(deadline d = deadline()) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<size_t> run(deadline d = deadline()) noexcept = 0;
   LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
 
-private:
+protected:
+  template <bool use_atomic> using _co_read_awaitable = io_awaitable<buffers_type, use_atomic>;
+  template <bool use_atomic> using _co_write_awaitable = io_awaitable<const_buffers_type, use_atomic>;
+  template <bool use_atomic> using _co_barrier_awaitable = io_awaitable<const_buffers_type, use_atomic>;
+
+  template <bool use_atomic> using _co_read_awaitable_promise_type = io_awaitable_promise_type<_co_read_awaitable<use_atomic>, use_atomic>;
+  template <bool use_atomic> using _co_write_awaitable_promise_type = io_awaitable_promise_type<_co_write_awaitable<use_atomic>, use_atomic>;
+  template <bool use_atomic> using _co_barrier_awaitable_promise_type = io_awaitable_promise_type<_co_barrier_awaitable<use_atomic>, use_atomic>;
+
+  constexpr io_context() {}
+
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _post(function_ptr<void *(void *)> &&f) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _register_io_handle(handle *h) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _deregister_io_handle(handle *h) noexcept = 0;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _submit_read(_co_read_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _submit_write(_co_write_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _submit_barrier(_co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _cancel_io(void *p) noexcept = 0;
 
 public:
   /*! Schedule the callable to be invoked by the thread owning this object and executing `run()` at its next
@@ -452,6 +493,7 @@ public:
     }
   }
 
+  //! \brief An awaitable returned by `co_post_self_to_context()`.
   struct co_post_self_to_context_awaitable
   {
     io_context *ctx;
@@ -475,21 +517,6 @@ public:
   convenience wrapper for `.post()`.
   */
   co_post_self_to_context_awaitable co_post_self_to_context() { return co_post_self_to_context_awaitable(this); }
-
-protected:
-  template <bool use_atomic> using _co_read_awaitable = io_awaitable<buffers_type, use_atomic>;
-  template <bool use_atomic> using _co_write_awaitable = io_awaitable<const_buffers_type, use_atomic>;
-  template <bool use_atomic> using _co_barrier_awaitable = io_awaitable<const_buffers_type, use_atomic>;
-
-  template <bool use_atomic> using _co_read_awaitable_promise_type = io_awaitable_promise_type<_co_read_awaitable<use_atomic>, use_atomic>;
-  template <bool use_atomic> using _co_write_awaitable_promise_type = io_awaitable_promise_type<_co_write_awaitable<use_atomic>, use_atomic>;
-  template <bool use_atomic> using _co_barrier_awaitable_promise_type = io_awaitable_promise_type<_co_barrier_awaitable<use_atomic>, use_atomic>;
-
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _submit_read(_co_read_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _submit_write(_co_write_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _submit_barrier(_co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
-
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _cancel_io(void *p) noexcept = 0;
 };
 
 //! \brief Thread local settings
@@ -507,6 +534,10 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   using awaitable_type = Awaitable;
   using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
   using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<bool>>;
+#ifdef _WIN32
+  static constexpr size_t _max_overlappeds = 64;
+#endif
+
   union result_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
     container_type value;
@@ -522,7 +553,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   union extra_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default2{};
 #ifdef _WIN32
-    OVERLAPPED ols[64];
+    OVERLAPPED ols[_max_overlappeds];
 #else
     function_ptr<container_type(io_awaitable_promise_type &p), 2 * sizeof(void *)> erased_op;  // used by the epoll implementation to retry the operation
 #endif

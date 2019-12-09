@@ -65,7 +65,7 @@ protected:
       function_ptr<void *(void *)> i, empty;
       {
         std::lock_guard<std::mutex> h(_lock);  // need real locking here
-        i = std::move(_items_posted);           // Detach item from front
+        i = std::move(_items_posted);          // Detach item from front
         _items_posted = std::move(*reinterpret_cast<function_ptr<void *(void *)> *>(i(&empty)));
         if(!_items_posted)
         {
@@ -95,7 +95,7 @@ public:
     }
   }
 
-  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
+  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override
   {
     std::lock_guard<std::mutex> h(_lock);  // need real locking here
     if(_last_item_posted == nullptr)

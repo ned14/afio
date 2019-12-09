@@ -328,6 +328,8 @@ namespace windows_nt_kernel
 
   using NtDelayExecution_t = NTSTATUS(NTAPI *)(_In_ BOOLEAN Alertable, _In_opt_ LARGE_INTEGER *Interval);
 
+  using NtRemoveIoCompletionEx_t = NTSTATUS (NTAPI *)(_In_ HANDLE IoCompletionHandle, /*PFILE_IO_COMPLETION_INFORMATION*/ LPOVERLAPPED_ENTRY IoCompletionInformation, _In_ ULONG Count, _Out_ PULONG NumEntriesRemoved, _In_opt_ PLARGE_INTEGER Timeout, _In_ BOOLEAN Alertable);
+
   // From https://msdn.microsoft.com/en-us/library/windows/hardware/ff566474(v=vs.85).aspx
   using NtLockFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ PLARGE_INTEGER ByteOffset, _In_ PLARGE_INTEGER Length, _In_ ULONG Key, _In_ BOOLEAN FailImmediately,
                                          _In_ BOOLEAN ExclusiveLock);
@@ -599,6 +601,7 @@ namespace windows_nt_kernel
   static NtWaitForSingleObject_t NtWaitForSingleObject;
   static NtWaitForMultipleObjects_t NtWaitForMultipleObjects;
   static NtDelayExecution_t NtDelayExecution;
+  static NtRemoveIoCompletionEx_t NtRemoveIoCompletionEx;
   static NtLockFile_t NtLockFile;
   static NtUnlockFile_t NtUnlockFile;
   static NtCreateSection_t NtCreateSection;
@@ -739,6 +742,13 @@ namespace windows_nt_kernel
     if(NtDelayExecution == nullptr)
     {
       if((NtDelayExecution = reinterpret_cast<NtDelayExecution_t>(GetProcAddress(ntdllh, "NtDelayExecution"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtRemoveIoCompletionEx == nullptr)
+    {
+      if((NtRemoveIoCompletionEx = reinterpret_cast<NtRemoveIoCompletionEx_t>(GetProcAddress(ntdllh, "NtRemoveIoCompletionEx"))) == nullptr)
       {
         abort();
       }

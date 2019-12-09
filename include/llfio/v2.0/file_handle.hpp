@@ -38,8 +38,6 @@ Distributed under the Boost Software License, Version 1.0.
 
 LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
-class io_service;
-
 /*! \class file_handle
 \brief A handle to a regular file or device, kept data layout compatible with
 async_file_handle.
@@ -74,9 +72,6 @@ public:
   using ino_t = fs_handle::ino_t;
   using path_view_type = fs_handle::path_view_type;
 
-protected:
-  io_service *_service{nullptr};
-
 public:
   //! Default constructor
   constexpr file_handle() {}  // NOLINT
@@ -84,7 +79,6 @@ public:
   constexpr file_handle(native_handle_type h, dev_t devid, ino_t inode, caching caching = caching::none, flag flags = flag::none)
       : lockable_io_handle(std::move(h), caching, flags)
       , fs_handle(devid, inode)
-      , _service(nullptr)
   {
   }
   //! No copy construction (use clone())
@@ -95,15 +89,12 @@ public:
   constexpr file_handle(file_handle &&o) noexcept
       : lockable_io_handle(std::move(o))
       , fs_handle(std::move(o))
-      , _service(o._service)
   {
-    o._service = nullptr;
   }
   //! Explicit conversion from handle and io_handle permitted
   explicit constexpr file_handle(handle &&o, dev_t devid, ino_t inode) noexcept
       : lockable_io_handle(std::move(o))
       , fs_handle(devid, inode)
-      , _service(nullptr)
   {
   }
   //! Move assignment of file_handle permitted
@@ -244,9 +235,6 @@ public:
   result<file_handle> clone(mode mode_ = mode::unchanged, caching caching_ = caching::unchanged, deadline d = std::chrono::seconds(30)) const noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(clone)
-
-  //! The i/o service this handle is attached to, if any
-  io_service *service() const noexcept { return _service; }
 
   /*! Return the current maximum permitted extent of the file.
 

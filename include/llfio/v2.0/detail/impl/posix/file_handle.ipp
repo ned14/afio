@@ -165,7 +165,6 @@ result<file_handle> file_handle::clone(mode mode_, caching caching_, deadline d)
   if(mode_ == mode::unchanged)
   {
     result<file_handle> ret(file_handle(native_handle_type(), _devid, _inode, caching_, _flags));
-    ret.value()._service = _service;
     ret.value()._v.behaviour = _v.behaviour;
     ret.value()._v.fd = ::fcntl(_v.fd, F_DUPFD_CLOEXEC);
     if(-1 == ret.value()._v.fd)
