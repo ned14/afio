@@ -417,7 +417,7 @@ public:
   Setting it to zero sets the default for this i/o context implementation, which for all
   i/o contexts implemented by LLFIO is 64.
   */
-  void set_maximum_pending_io(size_t no) noexcept { _maximum_pending_io = (0==no) ? 64 : no;}
+  void set_maximum_pending_io(size_t no) noexcept { _maximum_pending_io = (0 == no) ? 64 : no; }
 
   //! The native handle used by this i/o context
   native_handle_type native_handle() const noexcept { return _v; }
@@ -553,7 +553,27 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
   union extra_t {
     OUTCOME_V2_NAMESPACE::detail::empty_type _default2{};
 #ifdef _WIN32
-    OVERLAPPED ols[_max_overlappeds];
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)  // nonstandard extension used
+#endif
+    struct _OVERLAPPED
+    {
+      size_t Internal;
+      size_t InternalHigh;
+      union {
+        struct
+        {
+          unsigned long Offset;
+          unsigned long OffsetHigh;
+        };
+        void *Pointer;
+      };
+      void *hEvent;
+    } ols[_max_overlappeds];
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #else
     function_ptr<container_type(io_awaitable_promise_type &p), 2 * sizeof(void *)> erased_op;  // used by the epoll implementation to retry the operation
 #endif
@@ -587,7 +607,7 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
     if(1 == extra_in_use)
     {
 #ifdef _WIN32
-      memcpy(ols, o.ols, sizeof(ols));
+      memcpy(extra.ols, o.extra.ols, sizeof(extra.ols));
 #else
       new(&extra.erased_op) function_ptr<container_type(io_awaitable_promise_type & p), 2 * sizeof(void *)>(std::move(o.extra.erased_op));
 #endif

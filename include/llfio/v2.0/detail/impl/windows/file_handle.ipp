@@ -298,7 +298,6 @@ result<file_handle> file_handle::clone(mode mode_, caching caching_, deadline /*
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   result<file_handle> ret(file_handle(native_handle_type(), _devid, _inode, caching_, _flags));
-  ret.value()._service = _service;
   OUTCOME_TRY(do_clone_handle(ret.value()._v, _v, mode_, caching_, _flags));
   return ret;
 }

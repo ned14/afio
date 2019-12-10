@@ -129,14 +129,14 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::
   return io_context::win_iocp(threads);
 #else
 #error Unknown platform
-#endif
   return errc::not_supported;
+#endif
 }
 
 LLFIO_V2_NAMESPACE_END
 
 #if defined(_WIN32)
-#include "win/io_context.ipp"
+#include "windows/io_context.ipp"
 #else
 #include "posix/io_context.ipp"
 #endif

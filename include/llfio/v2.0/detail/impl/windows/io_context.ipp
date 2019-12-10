@@ -47,6 +47,8 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
   using _co_write_promise_type = typename _co_write_awaitable::promise_type;
   using _co_barrier_promise_type = typename _co_barrier_awaitable::promise_type;
 
+  static_assert(sizeof(typename _co_read_promise_type::extra_t::_OVERLAPPED) == sizeof(OVERLAPPED), "_co_read_promise_type::extra_t::_OVERLAPPED does not match OVERLAPPED!");
+
   struct registered_handle
   {
     enum io_kind
@@ -128,8 +130,8 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
     }
     else
     {
-      assert(it->second.last_io_outstanding == i);
-      it->second.last_io_outstanding = i->prev;
+      assert(rh->second.last_io_outstanding == i);
+      rh->second.last_io_outstanding = i->prev;
     }
     if(i->prev != nullptr)
     {
@@ -137,8 +139,8 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
     }
     else
     {
-      assert(it->second.next_io_outstanding == i);
-      it->second.next_io_outstanding = i->next;
+      assert(rh->second.next_io_outstanding == i);
+      rh->second.next_io_outstanding = i->next;
     }
     i->next = nullptr;
     i->prev = nullptr;
@@ -147,7 +149,7 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
 public:
   result<void> init(size_t threads)
   {
-    this->_v.h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, threads);
+    this->_v.h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, (DWORD) threads);
     if(nullptr == this->_v.h)
     {
       return win32_error();
@@ -172,8 +174,10 @@ public:
     PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
   }
 
-  virtual result<void *> _register_io_handle(handle *h) noexcept override final
+  virtual result<void> _register_io_handle(handle *h) noexcept override final
   {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
     try
     {
       registered_handle r;
@@ -185,13 +189,24 @@ public:
         r.free_io_outstanding = i;
       }
       _lock_guard g(this->_lock);
-      auto it = _registered_handles.insert({h->native_handle().h, std::move(r)});
-      if(nullptr == CreateIoCompletionPort(h->native_handle().h, this->_v.h, &(*it), 0))
+      auto it = _registered_handles.insert({h->native_handle().h, std::move(r)}).first;
+
+      IO_STATUS_BLOCK isb = make_iostatus();
+      FILE_COMPLETION_INFORMATION fci{};
+      memset(&fci, 0, sizeof(fci));
+      fci.Port = this->_v.h;
+      fci.Key = &(*it);
+      NTSTATUS ntstat = NtSetInformationFile(this->_v.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+      if(STATUS_PENDING == ntstat)
+      {
+        ntstat = ntwait(this->_v.h, isb, deadline());
+      }
+      if(ntstat < 0)
       {
         _registered_handles.erase(it);
-        return win32_error();
+        return ntkernel_error(ntstat);
       }
-      return it->second.ols;
+      return success();
     }
     catch(...)
     {
@@ -200,6 +215,8 @@ public:
   }
   virtual result<void> _deregister_io_handle(handle *h) noexcept override final
   {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
     try
     {
       registered_handle r;
@@ -223,6 +240,21 @@ public:
         auto *i = r.free_io_outstanding;
         r.free_io_outstanding = i->next;
         delete i;
+      }
+
+      IO_STATUS_BLOCK isb = make_iostatus();
+      FILE_COMPLETION_INFORMATION fci{};
+      memset(&fci, 0, sizeof(fci));
+      fci.Port = nullptr;
+      fci.Key = nullptr;
+      NTSTATUS ntstat = NtSetInformationFile(this->_v.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+      if(STATUS_PENDING == ntstat)
+      {
+        ntstat = ntwait(this->_v.h, isb, deadline());
+      }
+      if(ntstat < 0)
+      {
+        return ntkernel_error(ntstat);
       }
       return success();
     }
@@ -257,10 +289,10 @@ public:
         {
           resume_timed_out = _durations.begin()->second;
         }
-        else if(nullptr == timeout || togo.count() / -100 > timeout->QuadPart)
+        else if(nullptr == timeout || togo / -100 > timeout->QuadPart)
         {
           timeout = &_timeout;
-          timeout->QuadPart = togo.count() / -100;
+          timeout->QuadPart = togo / -100;
         }
       }
       if(!_absolutes.empty())
@@ -271,10 +303,10 @@ public:
         {
           resume_timed_out = _absolutes.begin()->second;
         }
-        else if(nullptr == timeout || togo.count() < -timeout->QuadPart)
+        else if(nullptr == timeout || togo < -timeout->QuadPart)
         {
           timeout = &_timeout;
-          timeout->QuadPart = windows_nt_kernel::from_timepoint(deadline_absolute);
+          *timeout = windows_nt_kernel::from_timepoint(deadline_absolute);
         }
       }
       // Set timed out
@@ -288,21 +320,21 @@ public:
           default:
             abort();
           case registered_handle::read:
-            it = _registered_handles.find(resume_timed_out->read_promise.nativeh.fd);
+            it = _registered_handles.find(resume_timed_out->read_promise.nativeh.h);
             if(it == _registered_handles.end())
             {
               abort();
             }
-            _remove_pending_io(it, resume_timed_out);
+            _remove_pending_io(&(*it), resume_timed_out);
             resume_timed_out->read_promise.return_value(errc::timed_out);
             break;
           case registered_handle::write:
-            it = _registered_handles.find(resume_timed_out->write_promise.nativeh.fd);
+            it = _registered_handles.find(resume_timed_out->write_promise.nativeh.h);
             if(it == _registered_handles.end())
             {
               abort();
             }
-            _remove_pending_io(it, resume_timed_out);
+            _remove_pending_io(&(*it), resume_timed_out);
             resume_timed_out->write_promise.return_value(errc::timed_out);
             break;
           }
@@ -313,17 +345,31 @@ public:
       OVERLAPPED_ENTRY entries[64];
       ULONG filled = 0;
       // Use this instead of GetQueuedCompletionStatusEx() as this implements absolute timeouts
-      NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, sizeof(entries)/sizeof(entries[0]), &filled, timeout, false));
+      NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, sizeof(entries) / sizeof(entries[0]), &filled, timeout, false);
       if(STATUS_TIMEOUT == ntstat)
       {
         // If the supplied deadline has passed, return errc::timed_out
-        LLFIO_POSIX_DEADLINE_TO_TIMEOUT_LOOP(d);
+        LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
         continue;
       }
       if(ntstat < 0)
       {
-        return ntkernel_error();
+        return ntkernel_error(ntstat);
       }
+      auto calculate_result = [](auto &promise, size_t /*unused*/) -> typename std::decay_t<decltype(promise)>::container_type
+      {
+        for(size_t n = 0; n < promise.reqs.buffers.size(); n++)
+        {
+          // It seems the NT kernel is guilty of casting bugs sometimes
+          promise.extra.ols[n].Internal = promise.extra.ols[n].Internal & 0xffffffff;
+          if(promise.extra.ols[n].Internal != 0)
+          {
+            return ntkernel_error(static_cast<NTSTATUS>(promise.extra.ols[n].Internal));
+          }
+          promise.reqs.buffers[n] = {promise.reqs.buffers[n].data(), promise.extra.ols[n].InternalHigh};
+        }
+        return std::decay_t<decltype(promise)>::container_type(std::move(promise.reqs.buffers));
+      };
       g.lock();
       size_t post_wakeups = 0;
       for(ULONG n = 0; n < filled; n++)
@@ -337,26 +383,32 @@ public:
           continue;
         }
         // The hEvent member is the io_outstanding_t used
-        auto *i = (typename registered_handle::io_outstanding_t *) rh->lpOverlapped->hEvent;
+        auto *i = (typename registered_handle::io_outstanding_t *) entries[n].lpOverlapped->hEvent;
         switch(i->kind)
         {
         default:
           abort();
         case registered_handle::read:
+        {
           auto result = calculate_result(i->read_promise, entries[n].dwNumberOfBytesTransferred);
           _remove_pending_io(rh, i);
           i->read_promise.return_value(std::move(result));
           break;
+        }
         case registered_handle::write:
+        {
           auto result = calculate_result(i->write_promise, entries[n].dwNumberOfBytesTransferred);
           _remove_pending_io(rh, i);
           i->write_promise.return_value(std::move(result));
           break;
+        }
         case registered_handle::barrier:
+        {
           auto result = calculate_result(i->barrier_promise, entries[n].dwNumberOfBytesTransferred);
           _remove_pending_io(rh, i);
           i->barrier_promise.return_value(std::move(result));
           break;
+        }
         }
       }
       if(filled - post_wakeups > 0)
@@ -376,9 +428,9 @@ public:
   {
     try
     {
-      LLFIO_POSIX_DEADLINE_TO_SLEEP_INIT(d);
+      LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
       _lock_guard g(this->_lock);
-      auto it = _registered_handles.find(p.nativeh.fd);
+      auto it = _registered_handles.find(p.nativeh.h);
       if(it == _registered_handles.end())
       {
         abort();
@@ -425,6 +477,8 @@ public:
         return _move_if_same_and_return_awaitable(&i->read_promise, std::move(p));
       case registered_handle::write:
         return _move_if_same_and_return_awaitable(&i->write_promise, std::move(p));
+      case registered_handle::barrier:
+        return _move_if_same_and_return_awaitable(&i->barrier_promise, std::move(p));
       }
     }
     catch(...)
@@ -434,42 +488,44 @@ public:
   }
   virtual typename _base::template _co_read_awaitable<false> _submit_read(typename _base::template _co_read_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::read, std::move(p), d); }
   virtual typename _base::template _co_write_awaitable<false> _submit_write(typename _base::template _co_write_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::write, std::move(p), d); }
-  virtual typename _base::template _co_barrier_awaitable<false> _submit_barrier(typename _base::template _co_barrier_awaitable_promise_type<false> && /*unused*/, deadline /*unused*/) noexcept override final
-  {
-    // Not implemented for the epoll() context
-    abort();
-  }
+  virtual typename _base::template _co_barrier_awaitable<false> _submit_barrier(typename _base::template _co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::barrier, std::move(p), d); }
 
   virtual result<void> _cancel_io(void *_i) noexcept override final
   {
     auto *i = (typename registered_handle::io_outstanding_t *) _i;
     typename _registered_handles_map_type::iterator it;
-    _lock_guard g(this->_lock);
+    auto do_cancel = [&](auto &promise) {
+      for(auto &ol : promise.extra.ols)
+      {
+        CancelIoEx(promise.nativeh.h, (LPOVERLAPPED) &ol);
+      }
+      for(auto &ol : promise.extra.ols)
+      {
+        ntwait(promise.nativeh.h, (OVERLAPPED &) ol, deadline());
+      }
+      _lock_guard g(this->_lock);
+      it = _registered_handles.find(promise.nativeh.h);
+      if(it == _registered_handles.end())
+      {
+        abort();
+      }
+      using promise_type = std::decay_t<decltype(promise)>;
+      promise.~promise_type();
+      _remove_pending_io(&(*it), i);
+      i->kind = registered_handle::unused;
+    };
     switch(i->kind)
     {
     default:
       abort();
     case registered_handle::read:
-      // He's still pending i/o, so destroy promise and remove
-      it = _registered_handles.find(i->read_promise.nativeh.fd);
-      if(it == _registered_handles.end())
-      {
-        abort();
-      }
-      i->read_promise.~_co_read_promise_type();
-      _remove_pending_io(it, i);
-      i->kind = registered_handle::unused;
+      do_cancel(i->read_promise);
       break;
     case registered_handle::write:
-      // He's still pending i/o, so destroy promise and remove
-      it = _registered_handles.find(i->write_promise.nativeh.fd);
-      if(it == _registered_handles.end())
-      {
-        abort();
-      }
-      i->write_promise.~_co_write_promise_type();
-      _remove_pending_io(it, i);
-      i->kind = registered_handle::unused;
+      do_cancel(i->write_promise);
+      break;
+    case registered_handle::barrier:
+      do_cancel(i->barrier_promise);
       break;
     }
     // Return to free lists
@@ -492,7 +548,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::
     else
     {
       auto ret = std::make_unique<win_iocp_impl<false>>();
-      OUTCOME_TRY(ret->init(threads));
+      OUTCOME_TRY(ret->init(1));
       return ret;
     }
   }
