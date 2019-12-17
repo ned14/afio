@@ -609,9 +609,22 @@ namespace detail
     virtual status_type _status() const noexcept = 0;
     // Called by the i/o context to cause the setting of the output buffers
     // and invocation of the receiver with the result. Or sets a failure.
-    virtual void _complete_io(result<size_t> bytes_transferred) noexcept = 0;
+    virtual void _complete_io(result<size_t> /*unused*/) noexcept { abort(); }
     // Called by the i/o context to cause the cancellation of the receiver
-    virtual void _cancel_io() noexcept = 0;
+    virtual void _cancel_io() noexcept { abort(); }
+  };
+
+  template <class T> class fake_atomic
+  {
+    T _v;
+
+  public:
+    constexpr fake_atomic(T v)
+        : _v(v)
+    {
+    }
+    T load(std::memory_order /*unused*/) const { return _v; }
+    void store(T v, std::memory_order /*unused*/) { _v = v; }
   };
 
   template <class HandleType, bool use_atomic> struct io_sender : public io_operation_connection
@@ -623,7 +636,7 @@ namespace detail
     using result_type = typename io_context::io_result<buffers_type>;
     using error_type = typename result_type::error_type;
     using status_type = typename io_operation_connection::status_type;
-    using result_set_type = std::conditional_t<is_atomic, std::atomic<status_type>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<status_type>>;
+    using result_set_type = std::conditional_t<is_atomic, std::atomic<status_type>, fake_atomic<status_type>>;
 
     result_set_type status{status_type::unscheduled};
     union storage_t {
@@ -636,7 +649,7 @@ namespace detail
       ~storage_t() {}
     } storage;
 
-    io_sender(handle_type &h, request_type req, deadline d = deadline())
+    io_sender(handle_type &h, request_type req = {}, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
         : io_operation_connection(h, d)
         , storage(req)
     {
@@ -671,6 +684,36 @@ namespace detail
         break;
       }
     }
+
+    //! True if started
+    bool started() const noexcept { return status.load(std::memory_order_acquire) != status_type::unscheduled; }
+    //! True if completed
+    bool completed() const noexcept { return status.load(std::memory_order_acquire) == status_type::completed; }
+    //! Access the request to be made when started
+    request_type &request() noexcept
+    {
+      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      return storage.req;
+    }
+    //! Access the request to be made when started
+    const request_type &request() const noexcept
+    {
+      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      return storage.req;
+    }
+    //! Access the deadline to be used when started
+    LLFIO_V2_NAMESPACE::deadline &deadline() noexcept
+    {
+      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      return this->d;
+    }
+    //! Access the deadline to be used when started
+    const LLFIO_V2_NAMESPACE::deadline &deadline() const noexcept
+    {
+      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      return this->d;
+    }
+
     void _create_result(result<size_t> toset) noexcept
     {
       if(toset.has_error())
@@ -705,9 +748,6 @@ namespace detail
     }
     virtual status_type _status() const noexcept override final { return status.load(std::memory_order_acquire); }
   };
-
-  template <class HandleType, bool use_atomic> constexpr inline bool is_io_sender(io_sender<HandleType, use_atomic> && /*unused*/) { return true; };
-  constexpr inline bool is_io_sender(...) { return false; };
 }  // namespace detail
 
 //! \brief A Sender of a non-atomic async read i/o on a handle
@@ -716,6 +756,8 @@ LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
 struct async_read : protected detail::io_sender<HandleType, use_atomic>
 {
   using detail::io_sender<HandleType, use_atomic>::io_sender;
+  using detail::io_sender<HandleType, use_atomic>::request;
+  using detail::io_sender<HandleType, use_atomic>::deadline;
 
 protected:
   void _begin_io() noexcept
@@ -733,6 +775,8 @@ LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
 struct async_write : protected detail::io_sender<HandleType, use_atomic>
 {
   using detail::io_sender<HandleType, use_atomic>::io_sender;
+  using detail::io_sender<HandleType, use_atomic>::request;
+  using detail::io_sender<HandleType, use_atomic>::deadline;
 
 protected:
   void _begin_io() noexcept
@@ -751,13 +795,29 @@ class async_barrier : protected detail::io_sender<HandleType, use_atomic>
 {
   using _base = detail::io_sender<HandleType, use_atomic>;
   using request_type = typename _base::request_type;
+  using status_type = typename _base::status_type;
   using barrier_kind = typename io_context::barrier_kind;
   barrier_kind _kind;
 
 public:
+  using _base::deadline;
   using _base::io_sender;
+  using _base::request;
 
-  explicit async_barrier(handle &h, request_type req, barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline())
+  //! Access the barrier kind to be made when started
+  barrier_kind &kind() noexcept
+  {
+    assert(this->status.load(std::memory_order_acquire) == status_type::unscheduled);
+    return _kind;
+  }
+  //! Access the barrier kind to be made when started
+  const barrier_kind &kind() const noexcept
+  {
+    assert(this->status.load(std::memory_order_acquire) == status_type::unscheduled);
+    return _kind;
+  }
+
+  explicit async_barrier(handle &h, request_type req = {}, barrier_kind kind = barrier_kind::nowait_data_only, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
       : _base(h, req, d)
       , _kind(kind)
   {
@@ -774,9 +834,9 @@ protected:
 template <class HandleType> using atomic_async_barrier = async_barrier<HandleType, true>;
 
 //! \brief The i/o operation connection state type
-template <class Sender, class Receiver> LLFIO_REQUIRES(detail::is_io_sender(std::declval<Sender>())) class io_operation_connection final : protected Sender
+template <class Sender, class Receiver> LLFIO_REQUIRES(std::is_base_of<detail::io_operation_connection, Sender>::value) class io_operation_connection final : protected Sender
 {
-  static_assert(detail::is_io_sender(std::declval<Sender>()), "Sender type is not an i/o sender type");
+  static_assert(std::is_base_of<detail::io_operation_connection, Sender>::value, "Sender type is not an i/o sender type");
 
 public:
   using sender_type = Sender;
@@ -818,7 +878,7 @@ private:
 
 public:
   //! \brief Use the `connect()` function in preference to using this directly
-  template <class _Sender, class _Receiver, class _BuffersType>
+  template <class _Sender, class _Receiver>
   io_operation_connection(_Sender &&sender, _Receiver &&receiver)
       : Sender(std::forward<_Sender>(sender))
       , _receiver(std::forward<_Receiver>(receiver))
@@ -826,15 +886,16 @@ public:
   }
   io_operation_connection(const io_operation_connection &) = delete;
   io_operation_connection(io_operation_connection &&o) noexcept
-      : Sender(std::move(o._sender))
+      : Sender(std::move(*this))
       , _receiver(std::move(o._receiver))
   {
-    assert(o.status_.load(std::memory_order_acquire) != _status_type::scheduled);
-    if(o.status_.load(std::memory_order_acquire) == _status_type::scheduled)
+    assert(o.status.load(std::memory_order_acquire) != _status_type::scheduled);
+    if(o.status.load(std::memory_order_acquire) == _status_type::scheduled)
     {
       abort();
     }
-    o.status_.store(_status_type::unknown, std::memory_order_release);
+    this->status.store(o.status.load(std::memory_order_acquire), std::memory_order_release);
+    o.status.store(_status_type::unknown, std::memory_order_release);
   }
   io_operation_connection &operator=(const io_operation_connection &) = delete;
   io_operation_connection &operator=(io_operation_connection &&o) noexcept
@@ -843,6 +904,17 @@ public:
     new(this) io_operation_connection(std::move(o));
     return *this;
   }
+
+  using Sender::completed;
+  using Sender::started;
+  //! \brief Access the sender
+  sender_type &sender() noexcept { return *this; }
+  //! \brief Access the sender
+  const sender_type &sender() const noexcept { return *this; }
+  //! \brief Access the receiver
+  receiver_type &receiver() noexcept { return _receiver; }
+  //! \brief Access the receiver
+  const receiver_type &receiver() const noexcept { return _receiver; }
 
   /*! \brief Start the operation. Note that it may complete immediately, possibly
   with failure. Any relative deadline begins at this point.
@@ -863,7 +935,7 @@ public:
       }
       else
       {
-        this->deadline_absolute = this->d.to_timepoint();
+        this->deadline_absolute = this->d.to_time_point();
       }
     }
     this->status.store(_status_type::scheduled, std::memory_order_release);

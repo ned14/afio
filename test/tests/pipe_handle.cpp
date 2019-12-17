@@ -91,7 +91,80 @@ static inline void TestNonBlockingPipeHandle()
   reader.close().value();
 }
 
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+static inline void TestMultiplexedPipeHandle()
+{
+  static constexpr size_t MAX_PIPES = 64;
+  namespace llfio = LLFIO_V2_NAMESPACE;
+  std::vector<llfio::pipe_handle> read_pipes, write_pipes;
+  std::vector<size_t> received_for(64);
+  struct checking_receiver
+  {
+    std::vector<size_t> &received_for;
+    union {
+      llfio::byte _buffer[sizeof(size_t)];
+      size_t _index;
+    };
+    llfio::pipe_handle::buffer_type buffer;
+
+    checking_receiver(std::vector<size_t> &r)
+        : received_for(r)
+        , buffer(_buffer, sizeof(_buffer))
+    {
+      memset(_buffer, 0, sizeof(_buffer));
+    }
+    void set_value(llfio::pipe_handle::io_result<llfio::pipe_handle::buffers_type> res)
+    {
+      BOOST_CHECK(res.has_value());
+      if(res)
+      {
+        BOOST_REQUIRE(res.value().size() == 1);
+        BOOST_CHECK(res.value()[0].data() == _buffer);
+        BOOST_CHECK(res.value()[0].size() == sizeof(size_t));
+        BOOST_REQUIRE(_index < MAX_PIPES);
+        received_for[_index]++;
+      }
+    }
+    void set_done() { std::cout << "Cancelled!" << std::endl; }
+  };
+  std::vector<llfio::io_operation_connection<llfio::async_read<llfio::pipe_handle>, checking_receiver>> async_reads;
+  auto multiplexer = llfio::this_thread::multiplexer();
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    auto ret = llfio::pipe_handle::anonymous_pipe(llfio::pipe_handle::caching::reads, llfio::pipe_handle::flag::multiplexable).value();
+    ret.first.set_multiplexer(multiplexer).value();
+    async_reads.push_back(llfio::connect(llfio::async_read<llfio::pipe_handle>(ret.first), checking_receiver(received_for)));
+    read_pipes.push_back(std::move(ret.first));
+    write_pipes.push_back(std::move(ret.second));
+  }
+  auto writerthread = std::async([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    for(size_t n = MAX_PIPES - 1; n < MAX_PIPES; n--)
+    {
+      write_pipes[n].write(0, {{(llfio::byte *) &n, sizeof(n)}});
+    }
+  });
+  // Start the connected states. They cannot move in memory until complete
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    async_reads[n].sender().request() = {{async_reads[n].receiver().buffer}, 0};
+    async_reads[n].start();
+  }
+  // Wait for all reads to complete
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    while(!async_reads[n].completed())
+    {
+      // Pump completions until all completed
+      multiplexer->run().value();
+    }
+  }
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    BOOST_CHECK(received_for[n] == 1);
+  }
+}
+
+#if LLFIO_ENABLE_COROUTINES && 0
 static inline void TestCoroutinedPipeHandle()
 {
   namespace llfio = LLFIO_V2_NAMESPACE;
@@ -173,6 +246,7 @@ static inline void TestCoroutinedPipeHandle()
 
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, blocking, "Tests that blocking llfio::pipe_handle works as expected", TestBlockingPipeHandle())
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, nonblocking, "Tests that nonblocking llfio::pipe_handle works as expected", TestNonBlockingPipeHandle())
-#ifdef OUTCOME_FOUND_COROUTINE_HEADER
+KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, multiplexed, "Tests that multiplexed llfio::pipe_handle works as expected", TestMultiplexedPipeHandle())
+#if LLFIO_ENABLE_COROUTINES && 0
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, coroutined, "Tests that coroutined llfio::pipe_handle works as expected", TestCoroutinedPipeHandle())
 #endif

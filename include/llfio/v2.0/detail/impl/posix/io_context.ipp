@@ -24,6 +24,8 @@ Distributed under the Boost Software License, Version 1.0.
 
 #include "../../../io_context.hpp"
 
+#if 0
+
 #include "import.hpp"
 
 #ifdef __linux__
@@ -571,4 +573,6 @@ LLFIO_V2_NAMESPACE_END
 #error bsd_kqueue i/o context not implemented yet!
 #else
 #error Unknown POSIX platform
+#endif
+
 #endif

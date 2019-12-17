@@ -327,6 +327,7 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
   return {reqs.buffers};
 }
 
+#if 0
 io_handle::co_read_awaitable<false> io_handle::co_read(io_request<buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
@@ -531,5 +532,6 @@ io_handle::co_barrier_awaitable<false> io_handle::co_barrier(io_request<const_bu
   }
   return errc::operation_not_supported;
 }
+#endif
 
 LLFIO_V2_NAMESPACE_END
