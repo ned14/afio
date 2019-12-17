@@ -45,7 +45,7 @@ Distributed under the Boost Software License, Version 1.0.
 #endif
 
 #ifndef LLFIO_PATH_VIEW_CHAR8_TYPE_EMULATED
-#if(defined(_MSC_VER) && !defined(__clang__) && !_HAS_CXX20) || (defined(__GNUC__) && !defined(__clang__) && !defined(__CHAR8_TYPE__)) || (defined(__clang__) && !defined(__CHAR8_TYPE__) && (__cplusplus < 201703L || __clang_major__ < 9))
+#if(defined(_MSC_VER) && !defined(__clang__) && !_HAS_CXX20) || (defined(__GNUC__) && !defined(__clang__) && !defined(__CHAR8_TYPE__)) || (defined(__clang__) && !defined(__CHAR8_TYPE__) && (__cplusplus <= 201703L || __clang_major__ < 9))
 #define LLFIO_PATH_VIEW_CHAR8_TYPE_EMULATED 1
 #else
 #define LLFIO_PATH_VIEW_CHAR8_TYPE_EMULATED 0

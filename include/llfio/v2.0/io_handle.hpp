@@ -55,15 +55,7 @@ public:
   using const_buffers_type = io_context::const_buffers_type;
   template <class T> using io_request = io_context::io_request<T>;
   template <class T> using io_result = io_context::io_result<T>;
-
-  //! The kinds of write reordering barrier which can be performed.
-  enum class barrier_kind
-  {
-    nowait_data_only,  //!< Barrier data only, non-blocking. This is highly optimised on NV-DIMM storage, but consider using `nvram_barrier()` for even better performance.
-    wait_data_only,    //!< Barrier data only, block until it is done. This is highly optimised on NV-DIMM storage, but consider using `nvram_barrier()` for even better performance.
-    nowait_all,        //!< Barrier data and the metadata to retrieve it, non-blocking.
-    wait_all           //!< Barrier data and the metadata to retrieve it, block until it is done.
-  };
+  using barrier_kind = io_context::barrier_kind;
 
 public:
   //! Default constructor
@@ -262,6 +254,7 @@ public:
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
+#if 0
   //! \brief The type for a read i/o awaitable
   template <bool use_atomic> using co_read_awaitable = typename io_context::template _co_read_awaitable<use_atomic>;
   //! \brief The type for a write i/o awaitable
@@ -319,6 +312,7 @@ public:
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_barrier_awaitable<false> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
+#endif
 };
 
 

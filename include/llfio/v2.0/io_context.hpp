@@ -36,6 +36,11 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
 class io_handle;
 
+namespace detail
+{
+  struct io_operation_connection;
+}
+
 template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type;
 template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable;
 
@@ -169,6 +174,15 @@ public:
   using creation = handle::creation;
   using caching = handle::caching;
   using flag = handle::flag;
+
+  //! The kinds of write reordering barrier which can be performed.
+  enum class barrier_kind
+  {
+    nowait_data_only,  //!< Barrier data only, non-blocking. This is highly optimised on NV-DIMM storage, but consider using `nvram_barrier()` for even better performance.
+    wait_data_only,    //!< Barrier data only, block until it is done. This is highly optimised on NV-DIMM storage, but consider using `nvram_barrier()` for even better performance.
+    nowait_all,        //!< Barrier data and the metadata to retrieve it, non-blocking.
+    wait_all           //!< Barrier data and the metadata to retrieve it, block until it is done.
+  };
 
   //! The scatter buffer type used by this handle. Guaranteed to be `TrivialType` and `StandardLayoutType`.
   //! Try to make address and length 64 byte, or ideally, `page_size()` aligned where possible.
@@ -422,7 +436,7 @@ public:
   //! The native handle used by this i/o context
   native_handle_type native_handle() const noexcept { return _v; }
 
-  /*! Checks if any items have been posted, or if any i/o scheduled has completed, if so
+  /*! \brief Checks if any items have been posted, or if any i/o scheduled has completed, if so
   either executes the posted item, or resumes any coroutines suspended pending the
   completion of the i/o. Returns the number of items or i/o completed; `errc::timed_out`
   if the deadline passed.
@@ -434,7 +448,19 @@ public:
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<size_t> run(deadline d = deadline()) noexcept = 0;
   LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
 
+  /*! \brief Cancels the previously begun i/o indicated, invoking the Receiver's done
+  implementation.
+  */
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void cancel_io(detail::io_operation_connection *op) noexcept = 0;
+
 protected:
+  constexpr io_context() {}
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _post(function_ptr<void *(void *)> &&f) noexcept = 0;
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _register_io_handle(handle *h) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _deregister_io_handle(handle *h) noexcept = 0;
+#if 0
   template <bool use_atomic> using _co_read_awaitable = io_awaitable<buffers_type, use_atomic>;
   template <bool use_atomic> using _co_write_awaitable = io_awaitable<const_buffers_type, use_atomic>;
   template <bool use_atomic> using _co_barrier_awaitable = io_awaitable<const_buffers_type, use_atomic>;
@@ -443,19 +469,17 @@ protected:
   template <bool use_atomic> using _co_write_awaitable_promise_type = io_awaitable_promise_type<_co_write_awaitable<use_atomic>, use_atomic>;
   template <bool use_atomic> using _co_barrier_awaitable_promise_type = io_awaitable_promise_type<_co_barrier_awaitable<use_atomic>, use_atomic>;
 
-  constexpr io_context() {}
-
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _post(function_ptr<void *(void *)> &&f) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _register_io_handle(handle *h) noexcept = 0;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _deregister_io_handle(handle *h) noexcept = 0;
-
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_read_awaitable<false> _submit_read(_co_read_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_write_awaitable<false> _submit_write(_co_write_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC _co_barrier_awaitable<false> _submit_barrier(_co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept = 0;
 
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> _cancel_io(void *p) noexcept = 0;
+#endif
 
 public:
+  // Called by io_handle::_begin_X().
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_io(detail::io_operation_connection *op) noexcept = 0;
+
   /*! Schedule the callable to be invoked by the thread owning this object and executing `run()` at its next
   available opportunity. Unlike any other function in this API layer, this function is thread safe.
 
@@ -528,30 +552,24 @@ namespace this_thread
   LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_context *ctx) noexcept;
 }  // namespace this_thread
 
-//! \brief The promise type for an i/o awaitable
-template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
+namespace detail
 {
-  using awaitable_type = Awaitable;
-  using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
-  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<bool>>;
+  struct io_operation_connection
+  {
+    enum class status_type
+    {
+      unknown,
+      unscheduled,
+      scheduled,
+      completed
+    };
 #ifdef _WIN32
-  static constexpr size_t _max_overlappeds = 64;
+    static constexpr size_t max_overlappeds = 64;
 #endif
 
-  union result_t {
-    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-    container_type value;
-    result_t() {}
-    ~result_t() {}
-  } result;
-  result_set_type result_set{false};
-  uint8_t extra_in_use{0};
-  io_context *ctx{nullptr};
-  void *internal_reference{nullptr};
-  native_handle_type nativeh;
-  typename io_context::template io_request<typename Awaitable::container_type> reqs{};
-  union extra_t {
-    OUTCOME_V2_NAMESPACE::detail::empty_type _default2{};
+    io_operation_connection *prev{nullptr}, *next{nullptr};
+    std::chrono::steady_clock::time_point deadline_duration;
+    std::chrono::system_clock::time_point deadline_absolute;
 #ifdef _WIN32
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -570,17 +588,329 @@ template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
         void *Pointer;
       };
       void *hEvent;
-    } ols[_max_overlappeds];
+    } ols[max_overlappeds];
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
-#else
-    function_ptr<container_type(io_awaitable_promise_type &p), 2 * sizeof(void *)> erased_op;  // used by the epoll implementation to retry the operation
 #endif
-    extra_t() {}
-    ~extra_t() {}
-  } extra;
+    io_context *ctx;
+    native_handle_type nativeh;
+    deadline d;
 
+    io_operation_connection(handle &h, deadline d)
+        : ctx(h.multiplexer())
+        , nativeh(h.native_handle())
+        , d(d)
+    {
+    }
+    virtual ~io_operation_connection() {}
+
+    // Returns the current status of the operation
+    virtual status_type _status() const noexcept = 0;
+    // Called by the i/o context to cause the setting of the output buffers
+    // and invocation of the receiver with the result. Or sets a failure.
+    virtual void _complete_io(result<size_t> bytes_transferred) noexcept = 0;
+    // Called by the i/o context to cause the cancellation of the receiver
+    virtual void _cancel_io() noexcept = 0;
+  };
+
+  template <class HandleType, bool use_atomic> struct io_sender : public io_operation_connection
+  {
+    using handle_type = HandleType;
+    static constexpr bool is_atomic = use_atomic;
+    using buffers_type = typename io_context::buffers_type;
+    using request_type = typename io_context::io_request<buffers_type>;
+    using result_type = typename io_context::io_result<buffers_type>;
+    using error_type = typename result_type::error_type;
+    using status_type = typename io_operation_connection::status_type;
+    using result_set_type = std::conditional_t<is_atomic, std::atomic<status_type>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<status_type>>;
+
+    result_set_type status{status_type::unscheduled};
+    union storage_t {
+      request_type req;
+      result_type ret;
+      storage_t(request_type _req)
+          : req(std::move(_req))
+      {
+      }
+      ~storage_t() {}
+    } storage;
+
+    io_sender(handle_type &h, request_type req, deadline d = deadline())
+        : io_operation_connection(h, d)
+        , storage(req)
+    {
+    }
+    ~io_sender()
+    {
+      switch(status.load(std::memory_order_acquire))
+      {
+      case status_type::unknown:
+        break;
+      case status_type::unscheduled:
+        // destruct req
+        storage.req.~request_type();
+        break;
+      case status_type::scheduled:
+        // Cancel the i/o
+        ctx->cancel_io(this);
+        if(status.load(std::memory_order_acquire) == status_type::completed)
+        {
+          // destruct ret
+          storage.ret.~result_type();
+        }
+        else
+        {
+          // destruct req
+          storage.req.~request_type();
+        }
+        break;
+      case status_type::completed:
+        // destruct ret
+        storage.ret.~result_type();
+        break;
+      }
+    }
+    void _create_result(result<size_t> toset) noexcept
+    {
+      if(toset.has_error())
+      {
+        // Set the result
+        storage.req.~request_type();
+        new(&storage.ret) result_type(std::move(toset.error()));
+        status.store(status_type::completed, std::memory_order_release);
+        return;
+      }
+      size_t bytes_transferred = toset.value();
+      buffers_type ret(storage.req.buffers);
+      // Set each individual buffer filled
+      for(size_t i = 0; i < ret.size(); i++)
+      {
+        auto &buffer = ret[i];
+        if(buffer.size() <= bytes_transferred)
+        {
+          bytes_transferred -= buffer.size();
+        }
+        else
+        {
+          buffer = {buffer.data(), (size_t) bytes_transferred};
+          ret = {ret.data(), i + 1};
+          break;
+        }
+      }
+      // Set the result
+      storage.req.~request_type();
+      new(&storage.ret) result_type(std::move(ret));
+      status.store(status_type::completed, std::memory_order_release);
+    }
+    virtual status_type _status() const noexcept override final { return status.load(std::memory_order_acquire); }
+  };
+
+  template <class HandleType, bool use_atomic> constexpr inline bool is_io_sender(io_sender<HandleType, use_atomic> && /*unused*/) { return true; };
+  constexpr inline bool is_io_sender(...) { return false; };
+}  // namespace detail
+
+//! \brief A Sender of a non-atomic async read i/o on a handle
+LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
+LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
+struct async_read : protected detail::io_sender<HandleType, use_atomic>
+{
+  using detail::io_sender<HandleType, use_atomic>::io_sender;
+
+protected:
+  void _begin_io() noexcept
+  {
+    // Begin a read
+    HandleType::_begin_read(this, this->storage.req);
+  }
+};
+//! \brief A Sender of an atomic async read i/o on a handle
+template <class HandleType> using atomic_async_read = async_read<HandleType, true>;
+
+//! \brief A Sender of a non-atomic async write i/o on a handle
+LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
+LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
+struct async_write : protected detail::io_sender<HandleType, use_atomic>
+{
+  using detail::io_sender<HandleType, use_atomic>::io_sender;
+
+protected:
+  void _begin_io() noexcept
+  {
+    // Begin a write
+    HandleType::_begin_write(this, this->storage.req);
+  }
+};
+//! \brief A Sender of an atomic async write i/o on a handle
+template <class HandleType> using atomic_async_write = async_write<HandleType, true>;
+
+//! \brief A Sender of a non-atomic async barrier i/o on a handle
+LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
+LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
+class async_barrier : protected detail::io_sender<HandleType, use_atomic>
+{
+  using _base = detail::io_sender<HandleType, use_atomic>;
+  using request_type = typename _base::request_type;
+  using barrier_kind = typename io_context::barrier_kind;
+  barrier_kind _kind;
+
+public:
+  using _base::io_sender;
+
+  explicit async_barrier(handle &h, request_type req, barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline())
+      : _base(h, req, d)
+      , _kind(kind)
+  {
+  }
+
+protected:
+  void _begin_io() noexcept
+  {
+    // Begin a barrier
+    HandleType::_begin_barrier(this, this->storage.req, _kind);
+  }
+};
+//! \brief A Sender of an atomic async barrier i/o on a handle
+template <class HandleType> using atomic_async_barrier = async_barrier<HandleType, true>;
+
+//! \brief The i/o operation connection state type
+template <class Sender, class Receiver> LLFIO_REQUIRES(detail::is_io_sender(std::declval<Sender>())) class io_operation_connection final : protected Sender
+{
+  static_assert(detail::is_io_sender(std::declval<Sender>()), "Sender type is not an i/o sender type");
+
+public:
+  using sender_type = Sender;
+  using receiver_type = Receiver;
+  using handle_type = typename sender_type::handle_type;
+  static constexpr bool is_atomic = sender_type::is_atomic;
+  using request_type = typename sender_type::request_type;
+  using result_type = typename sender_type::result_type;
+  using error_type = typename sender_type::error_type;
+
+private:
+  using _status_type = typename sender_type::status_type;
+  Receiver _receiver;
+
+  virtual void _complete_io(result<size_t> bytes_transferred) noexcept override final
+  {
+    assert(this->status.load(std::memory_order_acquire) == _status_type::scheduled);
+    if(this->status.load(std::memory_order_acquire) != _status_type::scheduled)
+    {
+      abort();
+    }
+    sender_type::_create_result(std::move(bytes_transferred));
+    // Set success or failure
+    _receiver.set_value(std::move(this->storage.ret));
+    this->status.store(_status_type::completed, std::memory_order_release);
+  }
+
+  virtual void _cancel_io() noexcept override final
+  {
+    assert(this->status.load(std::memory_order_acquire) == _status_type::scheduled);
+    if(this->status.load(std::memory_order_acquire) != _status_type::scheduled)
+    {
+      abort();
+    }
+    // Set cancelled
+    _receiver.set_done();
+    this->status.store(_status_type::completed, std::memory_order_release);
+  }
+
+public:
+  //! \brief Use the `connect()` function in preference to using this directly
+  template <class _Sender, class _Receiver, class _BuffersType>
+  io_operation_connection(_Sender &&sender, _Receiver &&receiver)
+      : Sender(std::forward<_Sender>(sender))
+      , _receiver(std::forward<_Receiver>(receiver))
+  {
+  }
+  io_operation_connection(const io_operation_connection &) = delete;
+  io_operation_connection(io_operation_connection &&o) noexcept
+      : Sender(std::move(o._sender))
+      , _receiver(std::move(o._receiver))
+  {
+    assert(o.status_.load(std::memory_order_acquire) != _status_type::scheduled);
+    if(o.status_.load(std::memory_order_acquire) == _status_type::scheduled)
+    {
+      abort();
+    }
+    o.status_.store(_status_type::unknown, std::memory_order_release);
+  }
+  io_operation_connection &operator=(const io_operation_connection &) = delete;
+  io_operation_connection &operator=(io_operation_connection &&o) noexcept
+  {
+    this->~io_operation_connection();
+    new(this) io_operation_connection(std::move(o));
+    return *this;
+  }
+
+  /*! \brief Start the operation. Note that it may complete immediately, possibly
+  with failure. Any relative deadline begins at this point.
+  */
+  void start() noexcept
+  {
+    assert(this->status.load(std::memory_order_acquire) == _status_type::unscheduled);
+    if(this->status.load(std::memory_order_acquire) != _status_type::unscheduled)
+    {
+      abort();
+    }
+    // If this i/o is timed, begin the timeout from now
+    if(this->d)
+    {
+      if(this->d.steady)
+      {
+        this->deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(this->d.nsecs);
+      }
+      else
+      {
+        this->deadline_absolute = this->d.to_timepoint();
+      }
+    }
+    this->status.store(_status_type::scheduled, std::memory_order_release);
+    // Ask the Sender to begin to i/o
+    this->_begin_io();
+  }
+  //! \brief Cancel the operation, if it is scheduled
+  void cancel() noexcept { this->ctx->cancel_io(this); }
+};
+
+//! \brief Connect an async_read Sender with a Receiver
+LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(                                                                                                            //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_read<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TEXPR(std::declval<Receiver>().set_done()))
+auto connect(async_read<HandleType, use_atomic> &&sender, Receiver &&receiver)
+{
+  return io_operation_connection<async_read<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+}
+
+//! \brief Connect an async_write Sender with a Receiver
+LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(                                                                                                             //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_write<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TEXPR(std::declval<Receiver>().set_done()))
+auto connect(async_write<HandleType, use_atomic> &&sender, Receiver &&receiver)
+{
+  return io_operation_connection<async_write<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+}
+
+//! \brief Connect an async_barrier Sender with a Receiver
+LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(                                                                                                               //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_barrier<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TEXPR(std::declval<Receiver>().set_done()))
+auto connect(async_barrier<HandleType, use_atomic> &&sender, Receiver &&receiver)
+{
+  return io_operation_connection<async_barrier<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+}
+
+#if 0
+//! \brief The promise type for an i/o awaitable
+template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
+{
+  using awaitable_type = Awaitable;
+  using container_type = typename io_context::template io_result<typename Awaitable::container_type>;
+  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<bool>>;
   // Constructor used by coroutines
   io_awaitable_promise_type() {}
   // Constructor used by co_read|co_write|co_barrier
@@ -810,6 +1140,7 @@ public:
     } while(!await_ready());
   }
 };
+#endif
 
 // BEGIN make_free_functions.py
 // END make_free_functions.py

@@ -27,7 +27,7 @@ Distributed under the Boost Software License, Version 1.0.
 #include "import.hpp"
 
 #ifndef _WIN32
-#error This implementation file is for Microsoft Windows
+#error This implementation file is for Microsoft Windows only
 #endif
 
 #include <chrono>
@@ -40,110 +40,50 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
 {
   using _base = io_context_impl<threadsafe>;
   using _lock_guard = typename _base::_lock_guard;
-  using _co_read_awaitable = typename _base::template _co_read_awaitable<threadsafe>;
-  using _co_write_awaitable = typename _base::template _co_write_awaitable<threadsafe>;
-  using _co_barrier_awaitable = typename _base::template _co_barrier_awaitable<threadsafe>;
-  using _co_read_promise_type = typename _co_read_awaitable::promise_type;
-  using _co_write_promise_type = typename _co_write_awaitable::promise_type;
-  using _co_barrier_promise_type = typename _co_barrier_awaitable::promise_type;
 
-  static_assert(sizeof(typename _co_read_promise_type::extra_t::_OVERLAPPED) == sizeof(OVERLAPPED), "_co_read_promise_type::extra_t::_OVERLAPPED does not match OVERLAPPED!");
+  static_assert(sizeof(typename detail::io_operation_connection::_OVERLAPPED) == sizeof(OVERLAPPED), "detail::io_operation_connection::_OVERLAPPED does not match OVERLAPPED!");
 
-  struct registered_handle
+  std::multimap<std::chrono::steady_clock::time_point, detail::io_operation_connection *> _durations;
+  std::multimap<std::chrono::system_clock::time_point, detail::io_operation_connection *> _absolutes;
+
+  // Lock must be held on entry!
+  void _remove_io(detail::io_operation_connection *op)
   {
-    enum io_kind
+    if(op->deadline_absolute != std::chrono::system_clock::time_point())
     {
-      unused,
-      read,
-      write,
-      barrier
-    };
-    struct io_outstanding_t
-    {
-      io_outstanding_t *prev{nullptr}, *next{nullptr};
-      std::chrono::steady_clock::time_point deadline_duration;
-      std::chrono::system_clock::time_point deadline_absolute;
-      io_kind kind{io_kind::unused};
-      union {
-        OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-        _co_read_promise_type read_promise;
-        _co_write_promise_type write_promise;
-        _co_barrier_promise_type barrier_promise;
-      };
-      io_outstanding_t() {}
-      ~io_outstanding_t() {}
-    } * next_io_outstanding{nullptr}, *last_io_outstanding{nullptr}, *free_io_outstanding{nullptr};
-
-    registered_handle() = default;
-  };
-  using _registered_handles_map_type = std::unordered_map<HANDLE, registered_handle>;
-  _registered_handles_map_type _registered_handles;
-  std::multimap<std::chrono::steady_clock::time_point, typename registered_handle::io_outstanding_t *> _durations;
-  std::multimap<std::chrono::system_clock::time_point, typename registered_handle::io_outstanding_t *> _absolutes;
-
-  void _remove_pending_io(typename _registered_handles_map_type::value_type *rh, typename registered_handle::io_outstanding_t *i)
-  {
-    if(i->next == nullptr && i->prev == nullptr)
-    {
-      return;
-    }
-    // Detach myself from the pending lists
-    if(i->deadline_duration != std::chrono::steady_clock::time_point())
-    {
-      auto dit = _durations.find(i->deadline_duration);
-      if(dit == _durations.end())
+      auto it = _absolutes.find(op->deadline_absolute);
+      if(it == _absolutes.end())
       {
         abort();
       }
-      while(dit->first == i->deadline_duration && dit->second != i)
+      do
       {
-        ++dit;
-      }
-      if(dit->first != i->deadline_duration)
-      {
-        abort();
-      }
-      _durations.erase(dit);
-      i->deadline_duration = {};
+        if(it->second == op)
+        {
+          _absolutes.erase(it);
+          return;
+        }
+        ++it;
+      } while(it != _absolutes.end() && it->first == op->deadline_absolute);
     }
-    if(i->deadline_absolute != std::chrono::system_clock::time_point())
+    else if(op->deadline_duration != std::chrono::steady_clock::time_point())
     {
-      auto dit = _absolutes.find(i->deadline_absolute);
-      if(dit == _absolutes.end())
-      {
-        abort();
-      }
-      while(dit->first == i->deadline_absolute && dit->second != i)
-      {
-        ++dit;
-      }
-      if(dit->first != i->deadline_absolute)
+      auto it = _durations.find(op->deadline_duration);
+      if(it == _durations.end())
       {
         abort();
       }
-      _absolutes.erase(dit);
-      i->deadline_absolute = {};
+      do
+      {
+        if(it->second == op)
+        {
+          _durations.erase(it);
+          return;
+        }
+        ++it;
+      } while(it != _durations.end() && it->first == op->deadline_duration);
     }
-    if(i->next != nullptr)
-    {
-      i->next->prev = i->prev;
-    }
-    else
-    {
-      assert(rh->second.last_io_outstanding == i);
-      rh->second.last_io_outstanding = i->prev;
-    }
-    if(i->prev != nullptr)
-    {
-      i->prev->next = i->next;
-    }
-    else
-    {
-      assert(rh->second.next_io_outstanding == i);
-      rh->second.next_io_outstanding = i->next;
-    }
-    i->next = nullptr;
-    i->prev = nullptr;
+    abort();
   }
 
 public:
@@ -159,9 +99,9 @@ public:
   virtual ~win_iocp_impl()
   {
     this->_lock.lock();
-    if(!_registered_handles.empty())
+    if(!_durations.empty() || !_absolutes.empty())
     {
-      LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with registered i/o handles");
+      LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with i/o handles still doing work");
       abort();
     }
     (void) CloseHandle(this->_v.h);
@@ -178,90 +118,41 @@ public:
   {
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
-    try
+    IO_STATUS_BLOCK isb = make_iostatus();
+    FILE_COMPLETION_INFORMATION fci{};
+    memset(&fci, 0, sizeof(fci));
+    fci.Port = this->_v.h;
+    fci.Key = (void *) 1;  // must not be null
+    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+    if(STATUS_PENDING == ntstat)
     {
-      registered_handle r;
-      // Preallocate i/o structures
-      for(size_t n = 0; n < this->maximum_pending_io(); n++)
-      {
-        auto *i = new typename registered_handle::io_outstanding_t;
-        i->next = r.free_io_outstanding;
-        r.free_io_outstanding = i;
-      }
-      _lock_guard g(this->_lock);
-      auto it = _registered_handles.insert({h->native_handle().h, std::move(r)}).first;
-
-      IO_STATUS_BLOCK isb = make_iostatus();
-      FILE_COMPLETION_INFORMATION fci{};
-      memset(&fci, 0, sizeof(fci));
-      fci.Port = this->_v.h;
-      fci.Key = &(*it);
-      NTSTATUS ntstat = NtSetInformationFile(this->_v.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
-      if(STATUS_PENDING == ntstat)
-      {
-        ntstat = ntwait(this->_v.h, isb, deadline());
-      }
-      if(ntstat < 0)
-      {
-        _registered_handles.erase(it);
-        return ntkernel_error(ntstat);
-      }
-      return success();
+      ntstat = ntwait(h->native_handle().h, isb, deadline());
     }
-    catch(...)
+    if(ntstat < 0)
     {
-      return error_from_exception();
+      return ntkernel_error(ntstat);
     }
+    return success();
   }
   virtual result<void> _deregister_io_handle(handle *h) noexcept override final
   {
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
-    try
+    IO_STATUS_BLOCK isb = make_iostatus();
+    FILE_COMPLETION_INFORMATION fci{};
+    memset(&fci, 0, sizeof(fci));
+    fci.Port = nullptr;
+    fci.Key = nullptr;
+    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+    if(STATUS_PENDING == ntstat)
     {
-      registered_handle r;
-      {
-        _lock_guard g(this->_lock);
-        auto it = _registered_handles.find(h->native_handle().h);
-        if(it == _registered_handles.end())
-        {
-          abort();
-        }
-        if(it->second.next_io_outstanding != nullptr)
-        {
-          return errc::operation_in_progress;
-        }
-        r = std::move(it->second);
-        _registered_handles.erase(it);
-      }
-      assert(r.next_io_outstanding == nullptr);
-      while(r.free_io_outstanding != nullptr)
-      {
-        auto *i = r.free_io_outstanding;
-        r.free_io_outstanding = i->next;
-        delete i;
-      }
-
-      IO_STATUS_BLOCK isb = make_iostatus();
-      FILE_COMPLETION_INFORMATION fci{};
-      memset(&fci, 0, sizeof(fci));
-      fci.Port = nullptr;
-      fci.Key = nullptr;
-      NTSTATUS ntstat = NtSetInformationFile(this->_v.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
-      if(STATUS_PENDING == ntstat)
-      {
-        ntstat = ntwait(this->_v.h, isb, deadline());
-      }
-      if(ntstat < 0)
-      {
-        return ntkernel_error(ntstat);
-      }
-      return success();
+      ntstat = ntwait(h->native_handle().h, isb, deadline());
     }
-    catch(...)
+    if(ntstat < 0)
     {
-      return error_from_exception();
+      return ntkernel_error(ntstat);
     }
+    return success();
   }
   virtual result<size_t> run(deadline d = deadline()) noexcept override final
   {
@@ -280,7 +171,7 @@ public:
       std::chrono::steady_clock::time_point deadline_duration;
       std::chrono::system_clock::time_point deadline_absolute;
       // Shorten the timeout if necessary
-      typename registered_handle::io_outstanding_t *resume_timed_out = nullptr;
+      detail::io_operation_connection *resume_timed_out = nullptr;
       if(!_durations.empty())
       {
         deadline_duration = _durations.begin()->first;
@@ -309,39 +200,16 @@ public:
           *timeout = windows_nt_kernel::from_timepoint(deadline_absolute);
         }
       }
+      g.unlock();
       // Set timed out
       if(resume_timed_out != nullptr)
       {
         if((resume_timed_out->deadline_duration != std::chrono::steady_clock::time_point() && resume_timed_out->deadline_duration == deadline_duration) || (resume_timed_out->deadline_absolute != std::chrono::system_clock::time_point() && resume_timed_out->deadline_absolute == deadline_absolute))
         {
-          typename _registered_handles_map_type::iterator it;
-          switch(resume_timed_out->kind)
-          {
-          default:
-            abort();
-          case registered_handle::read:
-            it = _registered_handles.find(resume_timed_out->read_promise.nativeh.h);
-            if(it == _registered_handles.end())
-            {
-              abort();
-            }
-            _remove_pending_io(&(*it), resume_timed_out);
-            resume_timed_out->read_promise.return_value(errc::timed_out);
-            break;
-          case registered_handle::write:
-            it = _registered_handles.find(resume_timed_out->write_promise.nativeh.h);
-            if(it == _registered_handles.end())
-            {
-              abort();
-            }
-            _remove_pending_io(&(*it), resume_timed_out);
-            resume_timed_out->write_promise.return_value(errc::timed_out);
-            break;
-          }
+          resume_timed_out->_complete_io(errc::timed_out);
           return 1;
         }
       }
-      g.unlock();
       OVERLAPPED_ENTRY entries[64];
       ULONG filled = 0;
       // Use this instead of GetQueuedCompletionStatusEx() as this implements absolute timeouts
@@ -356,60 +224,32 @@ public:
       {
         return ntkernel_error(ntstat);
       }
-      auto calculate_result = [](auto &promise, size_t /*unused*/) -> typename std::decay_t<decltype(promise)>::container_type
-      {
-        for(size_t n = 0; n < promise.reqs.buffers.size(); n++)
-        {
-          // It seems the NT kernel is guilty of casting bugs sometimes
-          promise.extra.ols[n].Internal = promise.extra.ols[n].Internal & 0xffffffff;
-          if(promise.extra.ols[n].Internal != 0)
-          {
-            return ntkernel_error(static_cast<NTSTATUS>(promise.extra.ols[n].Internal));
-          }
-          promise.reqs.buffers[n] = {promise.reqs.buffers[n].data(), promise.extra.ols[n].InternalHigh};
-        }
-        return std::decay_t<decltype(promise)>::container_type(std::move(promise.reqs.buffers));
-      };
       g.lock();
+      for(ULONG n = 0; n < filled; n++)
+      {
+        // If it's null, this is a post() wakeup
+        if(entries[n].lpCompletionKey == 0)
+        {
+          continue;
+        }
+        // The hEvent member is the io_operation_connection used
+        auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
+        if(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point())
+        {
+          _remove_io(op);
+        }
+      }
+      g.unlock();
       size_t post_wakeups = 0;
       for(ULONG n = 0; n < filled; n++)
       {
-        // Get the direct pointer to the HANDLE's tracked state
-        auto *rh = (typename _registered_handles_map_type::value_type *) entries[n].lpCompletionKey;
-        // If it's null, this is a post() wakeup
-        if(rh == nullptr)
+        if(entries[n].lpCompletionKey == 0)
         {
           ++post_wakeups;
           continue;
         }
-        // The hEvent member is the io_outstanding_t used
-        auto *i = (typename registered_handle::io_outstanding_t *) entries[n].lpOverlapped->hEvent;
-        switch(i->kind)
-        {
-        default:
-          abort();
-        case registered_handle::read:
-        {
-          auto result = calculate_result(i->read_promise, entries[n].dwNumberOfBytesTransferred);
-          _remove_pending_io(rh, i);
-          i->read_promise.return_value(std::move(result));
-          break;
-        }
-        case registered_handle::write:
-        {
-          auto result = calculate_result(i->write_promise, entries[n].dwNumberOfBytesTransferred);
-          _remove_pending_io(rh, i);
-          i->write_promise.return_value(std::move(result));
-          break;
-        }
-        case registered_handle::barrier:
-        {
-          auto result = calculate_result(i->barrier_promise, entries[n].dwNumberOfBytesTransferred);
-          _remove_pending_io(rh, i);
-          i->barrier_promise.return_value(std::move(result));
-          break;
-        }
-        }
+        auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
+        op->_complete_io(entries[n].dwNumberOfBytesTransferred);
       }
       if(filled - post_wakeups > 0)
       {
@@ -417,121 +257,75 @@ public:
       }
     }
   }
-  template <class D, class S> typename S::awaitable_type _move_if_same_and_return_awaitable(D * /*unused*/, S && /*unused*/) { abort(); }
-  template <class D> typename D::awaitable_type _move_if_same_and_return_awaitable(D *dest, D &&s)
-  {
-    // Put the promise into its final resting place, and return an awaitable pointing at that promise
-    auto *p = new(dest) D(std::move(s));
-    return p->get_return_object();
-  }
-  template <class Promise> typename Promise::awaitable_type _add_promise_to_wake_list(typename registered_handle::io_kind kind, Promise &&p, deadline d) noexcept
-  {
-    try
-    {
-      LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
-      _lock_guard g(this->_lock);
-      auto it = _registered_handles.find(p.nativeh.h);
-      if(it == _registered_handles.end())
-      {
-        abort();
-      }
-      if(it->second.free_io_outstanding == nullptr)
-      {
-        return errc::resource_unavailable_try_again;  // not enough i/o slots
-      }
-      auto *i = it->second.free_io_outstanding;
-      p.internal_reference = i;
-      if(d)
-      {
-        if(d.steady)
-        {
-          i->deadline_duration = std::chrono::steady_clock::now() + std::chrono::nanoseconds(d.nsecs);
-          i->deadline_absolute = {};
-          _durations.insert({i->deadline_duration, i});
-        }
-        else
-        {
-          i->deadline_duration = {};
-          i->deadline_absolute = d.to_time_point();
-          _absolutes.insert({i->deadline_absolute, i});
-        }
-      }
-      else
-      {
-        i->deadline_duration = {};
-        i->deadline_absolute = {};
-      }
-      i->kind = kind;
-      it->second.free_io_outstanding = i->next;
-      if(it->second.last_io_outstanding != nullptr)
-      {
-        it->second.last_io_outstanding->next = i;
-      }
-      i->prev = it->second.last_io_outstanding;
-      i->next = nullptr;
-      switch(kind)
-      {
-      default:
-        abort();
-      case registered_handle::read:
-        return _move_if_same_and_return_awaitable(&i->read_promise, std::move(p));
-      case registered_handle::write:
-        return _move_if_same_and_return_awaitable(&i->write_promise, std::move(p));
-      case registered_handle::barrier:
-        return _move_if_same_and_return_awaitable(&i->barrier_promise, std::move(p));
-      }
-    }
-    catch(...)
-    {
-      return error_from_exception();
-    }
-  }
-  virtual typename _base::template _co_read_awaitable<false> _submit_read(typename _base::template _co_read_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::read, std::move(p), d); }
-  virtual typename _base::template _co_write_awaitable<false> _submit_write(typename _base::template _co_write_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::write, std::move(p), d); }
-  virtual typename _base::template _co_barrier_awaitable<false> _submit_barrier(typename _base::template _co_barrier_awaitable_promise_type<false> &&p, deadline d) noexcept override final { return _add_promise_to_wake_list(registered_handle::barrier, std::move(p), d); }
 
-  virtual result<void> _cancel_io(void *_i) noexcept override final
+  virtual void cancel_io(detail::io_operation_connection *op) noexcept
   {
-    auto *i = (typename registered_handle::io_outstanding_t *) _i;
-    typename _registered_handles_map_type::iterator it;
-    auto do_cancel = [&](auto &promise) {
-      for(auto &ol : promise.extra.ols)
-      {
-        CancelIoEx(promise.nativeh.h, (LPOVERLAPPED) &ol);
-      }
-      for(auto &ol : promise.extra.ols)
-      {
-        ntwait(promise.nativeh.h, (OVERLAPPED &) ol, deadline());
-      }
-      _lock_guard g(this->_lock);
-      it = _registered_handles.find(promise.nativeh.h);
-      if(it == _registered_handles.end())
-      {
-        abort();
-      }
-      using promise_type = std::decay_t<decltype(promise)>;
-      promise.~promise_type();
-      _remove_pending_io(&(*it), i);
-      i->kind = registered_handle::unused;
-    };
-    switch(i->kind)
+    if(op->_status() == detail::io_operation_connection::status_type::scheduled)
     {
-    default:
-      abort();
-    case registered_handle::read:
-      do_cancel(i->read_promise);
-      break;
-    case registered_handle::write:
-      do_cancel(i->write_promise);
-      break;
-    case registered_handle::barrier:
-      do_cancel(i->barrier_promise);
-      break;
+      for(auto &ol : op->ols)
+      {
+        if(ol.Internal == -1)
+        {
+          CancelIoEx(op->nativeh.h, (LPOVERLAPPED) &ol);
+        }
+      }
+      for(auto &ol : op->ols)
+      {
+        if(ol.Internal == -1)
+        {
+          ntwait(op->nativeh.h, (OVERLAPPED &) ol, deadline());
+        }
+      }
+      if(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point())
+      {
+        _lock_guard g(this->_lock);
+        _remove_io(op);
+      }
     }
-    // Return to free lists
-    i->next = it->second.free_io_outstanding;
-    it->second.free_io_outstanding = i;
-    return success();
+    // Another thread may have processed the cancellation
+    if(op->_status() == detail::io_operation_connection::status_type::scheduled)
+    {
+      op->_cancel_io();
+    }
+  }
+  virtual void _begin_io(detail::io_operation_connection *op) noexcept
+  {
+    // All handles will already be registered with IOCP, so unless the i/o
+    // is timed, there is nothing else to do
+    if(op->deadline_absolute != std::chrono::system_clock::time_point())
+    {
+      try
+      {
+        _lock_guard g(this->_lock);
+        auto it = _absolutes.insert({op->deadline_absolute, op});
+        if(it == _absolutes.begin())
+        {
+          // Poke IOCP to wake
+          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+        }
+      }
+      catch(...)
+      {
+        op->_complete_io(error_from_exception());
+      }
+    }
+    else if(op->deadline_duration != std::chrono::steady_clock::time_point())
+    {
+      try
+      {
+        _lock_guard g(this->_lock);
+        auto it = _durations.insert({op->deadline_duration, op});
+        if(it == _durations.begin())
+        {
+          // Poke IOCP to wake
+          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+        }
+      }
+      catch(...)
+      {
+        op->_complete_io(error_from_exception());
+      }
+    }
   }
 };
 
