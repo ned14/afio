@@ -1430,7 +1430,7 @@ inline result<void> do_clone_handle(native_handle_type &dest, const native_handl
   if(mode_ == handle::mode::unchanged && caching_ == handle::caching::unchanged)
   {
     dest.behaviour = src.behaviour;
-    if(DuplicateHandle(GetCurrentProcess(), dest.h, GetCurrentProcess(), const_cast<HANDLE *>(&src.h), 0, 0, DUPLICATE_SAME_ACCESS) == 0)
+    if(DuplicateHandle(GetCurrentProcess(), src.h, GetCurrentProcess(), &dest.h, 0, 0, DUPLICATE_SAME_ACCESS) == 0)
     {
       return win32_error();
     }

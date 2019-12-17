@@ -130,10 +130,11 @@ if(NOT PROJECT_IS_DEPENDENCY)
                          -U OUTCOME_UNSTABLE_VERSION)
     endif()
   endif()
+
+  # Create a custom doxygen generation target
+  include(QuickCppLibMakeDoxygen)
 endif()
 
-# Create a custom doxygen generation target
-include(QuickCppLibMakeDoxygen)
 # Set the standard definitions for these libraries and bring in the all_* helper functions
 include(QuickCppLibApplyDefaultDefinitions)
 
