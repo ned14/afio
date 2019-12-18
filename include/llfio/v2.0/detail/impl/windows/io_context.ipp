@@ -36,6 +36,14 @@ Distributed under the Boost Software License, Version 1.0.
 
 LLFIO_V2_NAMESPACE_BEGIN
 
+namespace detail
+{
+#if LLFIO_EXPERIMENTAL_STATUS_CODE
+#else
+  LLFIO_HEADERS_ONLY_FUNC_SPEC error_info ntkernel_error_from_overlapped(size_t code) { return ntkernel_error((NTSTATUS) code); }
+#endif
+}  // namespace detail
+
 template <bool threadsafe> class win_iocp_impl final : public io_context_impl<threadsafe>
 {
   using _base = io_context_impl<threadsafe>;

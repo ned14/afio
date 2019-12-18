@@ -609,7 +609,7 @@ namespace detail
     virtual status_type _status() const noexcept = 0;
     // Called by the i/o context to cause the setting of the output buffers
     // and invocation of the receiver with the result. Or sets a failure.
-    virtual void _complete_io(result<size_t> /*unused*/) noexcept { abort(); }
+    virtual bool _complete_io(result<size_t> /*unused*/) noexcept { abort(); }
     // Called by the i/o context to cause the cancellation of the receiver
     virtual void _cancel_io() noexcept { abort(); }
   };
@@ -626,6 +626,7 @@ namespace detail
     T load(std::memory_order /*unused*/) const { return _v; }
     void store(T v, std::memory_order /*unused*/) { _v = v; }
   };
+  LLFIO_HEADERS_ONLY_FUNC_SPEC error_info ntkernel_error_from_overlapped(size_t);
 
   template <class HandleType, bool use_atomic> struct io_sender : public io_operation_connection
   {
@@ -724,22 +725,45 @@ namespace detail
         status.store(status_type::completed, std::memory_order_release);
         return;
       }
-      size_t bytes_transferred = toset.value();
       buffers_type ret(storage.req.buffers);
-      // Set each individual buffer filled
-      for(size_t i = 0; i < ret.size(); i++)
+      size_t bytes_transferred = toset.value();
+      if(bytes_transferred != (size_t) -1)
       {
-        auto &buffer = ret[i];
-        if(buffer.size() <= bytes_transferred)
+#ifdef _WIN32
+        for(size_t n = 0; n < storage.req.buffers.size(); n++)
         {
-          bytes_transferred -= buffer.size();
+          // It seems the NT kernel is guilty of casting bugs sometimes
+          ols[n].Internal = ols[n].Internal & 0xffffffff;
+          if(ols[n].Internal != 0)
+          {
+            storage.req.~request_type();
+            new(&storage.ret) result_type(ntkernel_error_from_overlapped(ols[n].Internal));
+            status.store(status_type::completed, std::memory_order_release);
+            return;
+          }
+          storage.req.buffers[n] = {storage.req.buffers[n].data(), ols[n].InternalHigh};
+          if(storage.req.buffers[n].size() != 0)
+          {
+            ret = {ret.data(), n + 1};
+          }
         }
-        else
+#else
+        // Set each individual buffer filled
+        for(size_t i = 0; i < storage.req.buffers.size(); i++)
         {
-          buffer = {buffer.data(), (size_t) bytes_transferred};
-          ret = {ret.data(), i + 1};
-          break;
+          auto &buffer = ret[i];
+          if(buffer.size() <= bytes_transferred)
+          {
+            bytes_transferred -= buffer.size();
+          }
+          else
+          {
+            buffer = {buffer.data(), (size_t) bytes_transferred};
+            ret = {ret.data(), i + 1};
+            break;
+          }
         }
+#endif
       }
       // Set the result
       storage.req.~request_type();
@@ -763,7 +787,9 @@ protected:
   void _begin_io() noexcept
   {
     // Begin a read
-    HandleType::_begin_read(this, this->storage.req);
+    HandleType temp(this->nativeh, 0, 0);
+    temp._begin_read(this, this->storage.req);
+    temp.release();
   }
 };
 //! \brief A Sender of an atomic async read i/o on a handle
@@ -782,7 +808,9 @@ protected:
   void _begin_io() noexcept
   {
     // Begin a write
-    HandleType::_begin_write(this, this->storage.req);
+    HandleType temp(this->nativeh, 0, 0);
+    temp._begin_write(this, this->storage.req);
+    temp.release();
   }
 };
 //! \brief A Sender of an atomic async write i/o on a handle
@@ -827,7 +855,9 @@ protected:
   void _begin_io() noexcept
   {
     // Begin a barrier
-    HandleType::_begin_barrier(this, this->storage.req, _kind);
+    HandleType temp(this->nativeh, 0, 0);
+    temp._begin_barrier(this, this->storage.req, _kind);
+    temp.release();
   }
 };
 //! \brief A Sender of an atomic async barrier i/o on a handle
@@ -851,7 +881,7 @@ private:
   using _status_type = typename sender_type::status_type;
   Receiver _receiver;
 
-  virtual void _complete_io(result<size_t> bytes_transferred) noexcept override final
+  virtual bool _complete_io(result<size_t> bytes_transferred) noexcept override final
   {
     assert(this->status.load(std::memory_order_acquire) == _status_type::scheduled);
     if(this->status.load(std::memory_order_acquire) != _status_type::scheduled)
@@ -862,6 +892,7 @@ private:
     // Set success or failure
     _receiver.set_value(std::move(this->storage.ret));
     this->status.store(_status_type::completed, std::memory_order_release);
+    return true;
   }
 
   virtual void _cancel_io() noexcept override final
@@ -948,8 +979,8 @@ public:
 
 //! \brief Connect an async_read Sender with a Receiver
 LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                            //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_read<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TREQUIRES(                                                                                                                              //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_read<HandleType, use_atomic> &&sender, Receiver &&receiver)
 {
@@ -958,8 +989,8 @@ auto connect(async_read<HandleType, use_atomic> &&sender, Receiver &&receiver)
 
 //! \brief Connect an async_write Sender with a Receiver
 LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                             //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_write<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TREQUIRES(                                                                                                                                    //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::const_buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_write<HandleType, use_atomic> &&sender, Receiver &&receiver)
 {
@@ -968,8 +999,8 @@ auto connect(async_write<HandleType, use_atomic> &&sender, Receiver &&receiver)
 
 //! \brief Connect an async_barrier Sender with a Receiver
 LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                               //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename async_barrier<HandleType, use_atomic>::result_type>())),  //
+LLFIO_TREQUIRES(                                                                                                                                    //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::const_buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_barrier<HandleType, use_atomic> &&sender, Receiver &&receiver)
 {

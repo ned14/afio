@@ -32,7 +32,7 @@ size_t io_handle::max_buffers() const noexcept
   return 1;  // TODO FIXME support ReadFileScatter/WriteFileGather
 }
 
-template <class BuffersType, class Syscall> inline io_handle::io_result<BuffersType> do_read_write(const native_handle_type &nativeh, Syscall &&syscall, io_handle::io_request<BuffersType> reqs, deadline d) noexcept
+template <bool blocking, class Syscall, class BuffersType> inline io_handle::io_result<BuffersType> do_read_write(span<OVERLAPPED> ols, const native_handle_type &nativeh, Syscall &&syscall, io_handle::io_request<BuffersType> reqs, deadline d) noexcept
 {
   if(d && !nativeh.is_nonblocking())
   {
@@ -42,11 +42,9 @@ template <class BuffersType, class Syscall> inline io_handle::io_result<BuffersT
   {
     return errc::argument_list_too_long;
   }
-
   LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
-  std::array<OVERLAPPED, 64> _ols{};
-  memset(_ols.data(), 0, reqs.buffers.size() * sizeof(OVERLAPPED));
-  span<OVERLAPPED> ols(_ols.data(), reqs.buffers.size());
+  ols = span<OVERLAPPED>(ols.data(), reqs.buffers.size());
+  memset(ols.data(), 0, reqs.buffers.size() * sizeof(OVERLAPPED));
   auto ol_it = ols.begin();
   DWORD transferred = 0;
   auto cancel_io = undoer([&] {
@@ -95,7 +93,7 @@ template <class BuffersType, class Syscall> inline io_handle::io_result<BuffersT
     reqs.offset += req.size();
   }
   // If handle is overlapped, wait for completion of each i/o.
-  if(nativeh.is_nonblocking())
+  if(nativeh.is_nonblocking() && blocking)
   {
     for(auto &ol : ols)
     {
@@ -108,6 +106,18 @@ template <class BuffersType, class Syscall> inline io_handle::io_result<BuffersT
     }
   }
   cancel_io.dismiss();
+  if(!blocking)
+  {
+    // If all the operations already completed, great
+    for(size_t n = 0; n < reqs.buffers.size(); n++)
+    {
+      if(ols[n].Internal == static_cast<ULONG_PTR>(-1))
+      {
+        return errc::operation_would_block;
+      }
+    }
+  }
+  auto ret(reqs.buffers);
   for(size_t n = 0; n < reqs.buffers.size(); n++)
   {
     // It seems the NT kernel is guilty of casting bugs sometimes
@@ -117,20 +127,26 @@ template <class BuffersType, class Syscall> inline io_handle::io_result<BuffersT
       return ntkernel_error(static_cast<NTSTATUS>(ols[n].Internal));
     }
     reqs.buffers[n] = {reqs.buffers[n].data(), ols[n].InternalHigh};
+    if(reqs.buffers[n].size() != 0)
+    {
+      ret = {ret.data(), n + 1};
+    }
   }
-  return io_handle::io_result<BuffersType>(std::move(reqs.buffers));
+  return io_handle::io_result<BuffersType>(std::move(ret));
 }
 
 io_handle::io_result<io_handle::buffers_type> io_handle::read(io_handle::io_request<io_handle::buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
-  return do_read_write(_v, &ReadFile, reqs, d);
+  std::array<OVERLAPPED, 64> _ols{};
+  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &ReadFile, reqs, d);
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::io_request<io_handle::const_buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
-  return do_read_write(_v, &WriteFile, reqs, d);
+  std::array<OVERLAPPED, 64> _ols{};
+  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &WriteFile, reqs, d);
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle::io_request<io_handle::const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
@@ -172,5 +188,89 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
   }
   return {reqs.buffers};
 }
+
+void io_handle::_begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept
+{
+  LLFIO_LOG_FUNCTION_CALL(this);
+  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &ReadFile, std::move(reqs), deadline());
+  if(r)
+  {
+    // The i/o completed immediately with success
+    state->_complete_io(result<size_t>(0));
+    return;
+  }
+  if(r.error() != errc::operation_would_block)
+  {
+    // The i/o completed immediately with failure
+    state->_complete_io(result<size_t>(r.error()));
+    return;
+  }
+  // The i/o will complete later. The IOCP i/o context does nothing if no deadline is specified
+  if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
+  {
+    state->ctx->_begin_io(state);
+  }
+}
+
+void io_handle::_begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept
+{
+  LLFIO_LOG_FUNCTION_CALL(this);
+  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &WriteFile, std::move(reqs), deadline());
+  if(r)
+  {
+    // The i/o completed immediately with success
+    state->_complete_io(result<size_t>(0));
+    return;
+  }
+  if(r.error() != errc::operation_would_block)
+  {
+    // The i/o completed immediately with failure
+    state->_complete_io(result<size_t>(r.error()));
+    return;
+  }
+  // The i/o will complete later. The IOCP i/o context does nothing if no deadline is specified
+  if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
+  {
+    state->ctx->_begin_io(state);
+  }
+}
+
+void io_handle::_begin_barrier(detail::io_operation_connection *state, io_request<buffers_type> /*unused*/, barrier_kind kind) noexcept
+{
+  windows_nt_kernel::init();
+  using namespace windows_nt_kernel;
+  LLFIO_LOG_FUNCTION_CALL(this);
+  memset(&state->ols[0], 0, sizeof(OVERLAPPED));
+  auto *isb = reinterpret_cast<IO_STATUS_BLOCK *>(&state->ols[0]);
+  *isb = make_iostatus();
+  ULONG flags = 0;
+  if(kind == barrier_kind::nowait_data_only)
+  {
+    flags = 1 /*FLUSH_FLAGS_FILE_DATA_ONLY*/;  // note this doesn't block
+  }
+  else if(kind == barrier_kind::nowait_all)
+  {
+    flags = 2 /*FLUSH_FLAGS_NO_SYNC*/;
+  }
+  NTSTATUS ntstat = NtFlushBuffersFileEx(state->nativeh.h, flags, nullptr, 0, isb);
+  if(STATUS_PENDING == ntstat)
+  {
+    // The i/o will complete later. The IOCP i/o context does nothing if no deadline is specified
+    if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
+    {
+      state->ctx->_begin_io(state);
+    }
+    return;
+  }
+  if(ntstat < 0)
+  {
+    // The i/o completed immediately with failure
+    state->_complete_io(result<size_t>(ntkernel_error(ntstat)));
+    return;
+  }
+  // The i/o completed immediately with success. Pass through the buffers unmodified
+  state->_complete_io(result<size_t>((size_t)-1));
+}
+
 
 LLFIO_V2_NAMESPACE_END
