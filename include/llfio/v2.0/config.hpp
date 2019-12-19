@@ -321,7 +321,13 @@ LLFIO_V2_NAMESPACE_END
 #include "quickcpplib/bitfield.hpp"
 // Bring in scoped undo
 #include "quickcpplib/scoped_undo.hpp"
-LLFIO_V2_NAMESPACE_BEGIN using QUICKCPPLIB_NAMESPACE::scoped_undo::undoer;
+LLFIO_V2_NAMESPACE_BEGIN
+using QUICKCPPLIB_NAMESPACE::scoped_undo::undoer;
+LLFIO_V2_NAMESPACE_END
+// Bring in a spinlock
+#include "quickcpplib/spinlock.hpp"
+LLFIO_V2_NAMESPACE_BEGIN
+namespace spinlocks = QUICKCPPLIB_NAMESPACE::configurable_spinlock;
 LLFIO_V2_NAMESPACE_END
 // Bring in a span implementation
 #include "quickcpplib/span.hpp"

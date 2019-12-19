@@ -256,7 +256,10 @@ public:
 
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept;
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_barrier(detail::io_operation_connection *state, io_request<buffers_type> reqs, barrier_kind kind) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) noexcept;
 #if 0
   //! \brief The type for a read i/o awaitable
   template <bool use_atomic> using co_read_awaitable = typename io_context::template _co_read_awaitable<use_atomic>;

@@ -448,11 +448,6 @@ public:
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<size_t> run(deadline d = deadline()) noexcept = 0;
   LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
 
-  /*! \brief Cancels the previously begun i/o indicated, invoking the Receiver's done
-  implementation.
-  */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void cancel_io(detail::io_operation_connection *op) noexcept = 0;
-
 protected:
   constexpr io_context() {}
 
@@ -477,8 +472,8 @@ protected:
 #endif
 
 public:
-  // Called by io_handle::_begin_X().
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_io(detail::io_operation_connection *op) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _register_pending_io(detail::io_operation_connection *op) noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _deregister_pending_io(detail::io_operation_connection *op) noexcept = 0;
 
   /*! Schedule the callable to be invoked by the thread owning this object and executing `run()` at its next
   available opportunity. Unlike any other function in this API layer, this function is thread safe.
@@ -577,7 +572,7 @@ namespace detail
 #endif
     struct _OVERLAPPED
     {
-      size_t Internal;
+      volatile size_t Internal;  // volatile has acquire-release atomic semantics on MSVC
       size_t InternalHigh;
       union {
         struct
@@ -596,6 +591,10 @@ namespace detail
     io_context *ctx;
     native_handle_type nativeh;
     deadline d;
+    bool is_registered_with_io_context{false};
+#ifdef _WIN32
+    bool is_registered_with_iocp{false};
+    #endif
 
     io_operation_connection(handle &h, deadline d)
         : ctx(h.multiplexer())
@@ -605,8 +604,8 @@ namespace detail
     }
     virtual ~io_operation_connection() {}
 
-    // Returns the current status of the operation
-    virtual status_type _status() const noexcept = 0;
+    // Returns the current status of the operation. May immediately complete the i/o.
+    virtual status_type _status() noexcept { abort(); }
     // Called by the i/o context to cause the setting of the output buffers
     // and invocation of the receiver with the result. Or sets a failure.
     virtual bool _complete_io(result<size_t> /*unused*/) noexcept { abort(); }
@@ -626,6 +625,11 @@ namespace detail
     T load(std::memory_order /*unused*/) const { return _v; }
     void store(T v, std::memory_order /*unused*/) { _v = v; }
   };
+  struct fake_mutex
+  {
+    void lock() {}
+    void unlock() {}
+  };
   LLFIO_HEADERS_ONLY_FUNC_SPEC error_info ntkernel_error_from_overlapped(size_t);
 
   template <class HandleType, bool use_atomic> struct io_sender : public io_operation_connection
@@ -638,7 +642,10 @@ namespace detail
     using error_type = typename result_type::error_type;
     using status_type = typename io_operation_connection::status_type;
     using result_set_type = std::conditional_t<is_atomic, std::atomic<status_type>, fake_atomic<status_type>>;
+    using lock_type = std::conditional_t<is_atomic, spinlocks::spinlock<uintptr_t>, fake_mutex>;
+    using lock_guard = spinlocks::lock_guard<lock_type>;
 
+    lock_type lock;
     result_set_type status{status_type::unscheduled};
     union storage_t {
       request_type req;
@@ -666,19 +673,8 @@ namespace detail
         storage.req.~request_type();
         break;
       case status_type::scheduled:
-        // Cancel the i/o
-        ctx->cancel_io(this);
-        if(status.load(std::memory_order_acquire) == status_type::completed)
-        {
-          // destruct ret
-          storage.ret.~result_type();
-        }
-        else
-        {
-          // destruct req
-          storage.req.~request_type();
-        }
-        break;
+        // Should never occur
+        abort();
       case status_type::completed:
         // destruct ret
         storage.ret.~result_type();
@@ -693,30 +689,35 @@ namespace detail
     //! Access the request to be made when started
     request_type &request() noexcept
     {
-      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      assert(status.load(std::memory_order_acquire) != status_type::scheduled);
       return storage.req;
     }
     //! Access the request to be made when started
     const request_type &request() const noexcept
     {
-      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      assert(status.load(std::memory_order_acquire) != status_type::scheduled);
       return storage.req;
     }
     //! Access the deadline to be used when started
     LLFIO_V2_NAMESPACE::deadline &deadline() noexcept
     {
-      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      assert(status.load(std::memory_order_acquire) != status_type::scheduled);
       return this->d;
     }
     //! Access the deadline to be used when started
     const LLFIO_V2_NAMESPACE::deadline &deadline() const noexcept
     {
-      assert(status.load(std::memory_order_acquire) == status_type::unscheduled);
+      assert(status.load(std::memory_order_acquire) != status_type::scheduled);
       return this->d;
     }
 
+    // Lock must be held on entry!
     void _create_result(result<size_t> toset) noexcept
     {
+      if(this->is_registered_with_io_context)
+      {
+        this->ctx->_deregister_pending_io(this);
+      }
       if(toset.has_error())
       {
         // Set the result
@@ -733,11 +734,11 @@ namespace detail
         for(size_t n = 0; n < storage.req.buffers.size(); n++)
         {
           // It seems the NT kernel is guilty of casting bugs sometimes
-          ols[n].Internal = ols[n].Internal & 0xffffffff;
-          if(ols[n].Internal != 0)
+          size_t internal = ols[n].Internal & 0xffffffff;
+          if(internal != 0)
           {
             storage.req.~request_type();
-            new(&storage.ret) result_type(ntkernel_error_from_overlapped(ols[n].Internal));
+            new(&storage.ret) result_type(ntkernel_error_from_overlapped(internal));
             status.store(status_type::completed, std::memory_order_release);
             return;
           }
@@ -770,7 +771,6 @@ namespace detail
       new(&storage.ret) result_type(std::move(ret));
       status.store(status_type::completed, std::memory_order_release);
     }
-    virtual status_type _status() const noexcept override final { return status.load(std::memory_order_acquire); }
   };
 }  // namespace detail
 
@@ -789,6 +789,13 @@ protected:
     // Begin a read
     HandleType temp(this->nativeh, 0, 0);
     temp._begin_read(this, this->storage.req);
+    temp.release();
+  }
+  void _cancel_io() noexcept
+  {
+    // Cancel a read
+    HandleType temp(this->nativeh, 0, 0);
+    temp._cancel_read(this, this->storage.req);
     temp.release();
   }
 };
@@ -810,6 +817,13 @@ protected:
     // Begin a write
     HandleType temp(this->nativeh, 0, 0);
     temp._begin_write(this, this->storage.req);
+    temp.release();
+  }
+  void _cancel_io() noexcept
+  {
+    // Cancel a write
+    HandleType temp(this->nativeh, 0, 0);
+    temp._cancel_write(this, this->storage.req);
     temp.release();
   }
 };
@@ -859,6 +873,13 @@ protected:
     temp._begin_barrier(this, this->storage.req, _kind);
     temp.release();
   }
+  void _cancel_io() noexcept
+  {
+    // Cancel a barrier
+    HandleType temp(this->nativeh, 0, 0);
+    temp._cancel_barrier(this, this->storage.req, _kind);
+    temp.release();
+  }
 };
 //! \brief A Sender of an atomic async barrier i/o on a handle
 template <class HandleType> using atomic_async_barrier = async_barrier<HandleType, true>;
@@ -879,32 +900,64 @@ public:
 
 private:
   using _status_type = typename sender_type::status_type;
+  using _lock_guard = typename sender_type::lock_guard;
   Receiver _receiver;
 
+  virtual _status_type _status() noexcept override final
+  {
+    auto ret = this->status.load(std::memory_order_acquire);
+#ifdef _WIN32
+    if(ret == _status_type::scheduled)
+    {
+      // The OVERLAPPED structures can complete asynchronously. If they
+      // have completed, complete i/o right now.
+      bool asynchronously_completed = true;
+      for(size_t n = 0; n < this->storage.req.buffers.size(); n++)
+      {
+        if(this->ols[n].Internal == (size_t) -1)
+        {
+          asynchronously_completed = false;
+          break;
+        }
+      }
+      if(asynchronously_completed)
+      {
+        _complete_io(result<size_t>(0));
+        return _status_type::completed;
+      }
+    }
+#endif
+    return ret;
+  }
   virtual bool _complete_io(result<size_t> bytes_transferred) noexcept override final
   {
-    assert(this->status.load(std::memory_order_acquire) == _status_type::scheduled);
-    if(this->status.load(std::memory_order_acquire) != _status_type::scheduled)
+    if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
     {
-      abort();
+      _lock_guard g(this->lock);
+      if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
+      {
+        sender_type::_create_result(std::move(bytes_transferred));
+        // Set success or failure
+        _receiver.set_value(std::move(this->storage.ret));
+        return true;
+      }
     }
-    sender_type::_create_result(std::move(bytes_transferred));
-    // Set success or failure
-    _receiver.set_value(std::move(this->storage.ret));
-    this->status.store(_status_type::completed, std::memory_order_release);
-    return true;
+    return false;
   }
 
   virtual void _cancel_io() noexcept override final
   {
-    assert(this->status.load(std::memory_order_acquire) == _status_type::scheduled);
-    if(this->status.load(std::memory_order_acquire) != _status_type::scheduled)
+    if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
     {
-      abort();
+      _lock_guard g(this->lock);
+      if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
+      {
+        this->_cancel_io();
+        sender_type::_create_result(errc::operation_canceled);
+        // Set cancelled
+        _receiver.set_done();
+      }
     }
-    // Set cancelled
-    _receiver.set_done();
-    this->status.store(_status_type::completed, std::memory_order_release);
   }
 
 public:
@@ -935,6 +988,7 @@ public:
     new(this) io_operation_connection(std::move(o));
     return *this;
   }
+  ~io_operation_connection() { _cancel_io(); }
 
   using Sender::completed;
   using Sender::started;
@@ -974,7 +1028,7 @@ public:
     this->_begin_io();
   }
   //! \brief Cancel the operation, if it is scheduled
-  void cancel() noexcept { this->ctx->cancel_io(this); }
+  void cancel() noexcept {_cancel_io(); }
 };
 
 //! \brief Connect an async_read Sender with a Receiver

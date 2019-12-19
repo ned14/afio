@@ -51,12 +51,30 @@ template <bool threadsafe> class win_iocp_impl final : public io_context_impl<th
 
   static_assert(sizeof(typename detail::io_operation_connection::_OVERLAPPED) == sizeof(OVERLAPPED), "detail::io_operation_connection::_OVERLAPPED does not match OVERLAPPED!");
 
+  std::atomic<size_t> _concurrent_run_instances{0};
+  detail::io_operation_connection *_pending_begin{nullptr}, *_pending_end{nullptr};
   std::multimap<std::chrono::steady_clock::time_point, detail::io_operation_connection *> _durations;
   std::multimap<std::chrono::system_clock::time_point, detail::io_operation_connection *> _absolutes;
 
   // Lock must be held on entry!
   void _remove_io(detail::io_operation_connection *op)
   {
+    if(op->prev == nullptr)
+    {
+      _pending_begin = op->next;
+    }
+    else
+    {
+      op->prev->next = op->next;
+    }
+    if(op->next == nullptr)
+    {
+      _pending_end = op->prev;
+    }
+    else
+    {
+      op->next->prev = op->prev;
+    }
     if(op->deadline_absolute != std::chrono::system_clock::time_point())
     {
       auto it = _absolutes.find(op->deadline_absolute);
@@ -122,51 +140,18 @@ public:
     PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
   }
 
-  virtual result<void> _register_io_handle(handle *h) noexcept override final
+  virtual result<void> _register_io_handle(handle * /*unused*/) noexcept override final
   {
-    windows_nt_kernel::init();
-    using namespace windows_nt_kernel;
-    IO_STATUS_BLOCK isb = make_iostatus();
-    FILE_COMPLETION_INFORMATION fci{};
-    memset(&fci, 0, sizeof(fci));
-    fci.Port = this->_v.h;
-    fci.Key = (void *) 1;  // must not be null
-    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
-    if(STATUS_PENDING == ntstat)
-    {
-      ntstat = ntwait(h->native_handle().h, isb, deadline());
-    }
-    if(ntstat < 0)
-    {
-      return ntkernel_error(ntstat);
-    }
     return success();
   }
-  virtual result<void> _deregister_io_handle(handle *h) noexcept override final
-  {
-    windows_nt_kernel::init();
-    using namespace windows_nt_kernel;
-    IO_STATUS_BLOCK isb = make_iostatus();
-    FILE_COMPLETION_INFORMATION fci{};
-    memset(&fci, 0, sizeof(fci));
-    fci.Port = nullptr;
-    fci.Key = nullptr;
-    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
-    if(STATUS_PENDING == ntstat)
-    {
-      ntstat = ntwait(h->native_handle().h, isb, deadline());
-    }
-    if(ntstat < 0)
-    {
-      return ntkernel_error(ntstat);
-    }
-    return success();
-  }
+  virtual result<void> _deregister_io_handle(handle * /*unused*/) noexcept override final { return success(); }
   virtual result<size_t> run(deadline d = deadline()) noexcept override final
   {
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
     LLFIO_LOG_FUNCTION_CALL(this);
+    _concurrent_run_instances.fetch_add(1, std::memory_order_acq_rel);
+    auto unconcurrent_run_instances = undoer([this] { _concurrent_run_instances.fetch_sub(1, std::memory_order_acq_rel); });
     LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
     for(;;)
     {
@@ -174,11 +159,30 @@ public:
       {
         return 1;
       }
-      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);
       _lock_guard g(this->_lock);
+
+      // Firstly register any recently added pending i/o with IOCP
+      for(auto *i = _pending_end; i != nullptr && !i->is_registered_with_io_context; i = i->prev)
+      {
+        IO_STATUS_BLOCK isb = make_iostatus();
+        FILE_COMPLETION_INFORMATION fci{};
+        memset(&fci, 0, sizeof(fci));
+        fci.Port = this->_v.h;
+        fci.Key = i;
+        NTSTATUS ntstat = NtSetInformationFile(i->nativeh.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+        if(STATUS_PENDING == ntstat)
+        {
+          ntstat = ntwait(i->nativeh.h, isb, deadline());
+        }
+        if(ntstat < 0)
+        {
+          return ntkernel_error(ntstat);
+        }
+      }
+
+      // Process timed out pending operations, shortening the requested timeout if necessary
       std::chrono::steady_clock::time_point deadline_duration;
       std::chrono::system_clock::time_point deadline_absolute;
-      // Shorten the timeout if necessary
       detail::io_operation_connection *resume_timed_out = nullptr;
       if(!_durations.empty())
       {
@@ -209,18 +213,16 @@ public:
         }
       }
       g.unlock();
-      // Set timed out
+      // Complete with timed out
       if(resume_timed_out != nullptr)
       {
-        if((resume_timed_out->deadline_duration != std::chrono::steady_clock::time_point() && resume_timed_out->deadline_duration == deadline_duration) || (resume_timed_out->deadline_absolute != std::chrono::system_clock::time_point() && resume_timed_out->deadline_absolute == deadline_absolute))
-        {
-          resume_timed_out->_complete_io(errc::timed_out);
-          return 1;
-        }
+        resume_timed_out->_complete_io(errc::timed_out);
+        return 1;
       }
       OVERLAPPED_ENTRY entries[64];
       ULONG filled = 0;
       // Use this instead of GetQueuedCompletionStatusEx() as this implements absolute timeouts
+      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
       NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, sizeof(entries) / sizeof(entries[0]), &filled, timeout, false);
       if(STATUS_TIMEOUT == ntstat)
       {
@@ -266,74 +268,83 @@ public:
     }
   }
 
-  virtual void cancel_io(detail::io_operation_connection *op) noexcept
+  virtual void _register_pending_io(detail::io_operation_connection *op) noexcept
   {
-    if(op->_status() == detail::io_operation_connection::status_type::scheduled)
+    // We only get called for i/o which didn't immediately complete
+    // Add this state to the list of pending i/o
+    bool need_to_wake_all = false;
+    try
     {
-      for(auto &ol : op->ols)
+      _lock_guard g(this->_lock);
+      op->next = nullptr;
+      op->prev = _pending_end;
+      if(_pending_end == nullptr)
       {
-        if(ol.Internal == -1)
-        {
-          CancelIoEx(op->nativeh.h, (LPOVERLAPPED) &ol);
-        }
+        _pending_begin = op;
       }
-      for(auto &ol : op->ols)
+      else
       {
-        if(ol.Internal == -1)
-        {
-          ntwait(op->nativeh.h, (OVERLAPPED &) ol, deadline());
-        }
+        _pending_end->next = op;
       }
-      if(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point())
+      _pending_end = op;
+      if(op->deadline_absolute != std::chrono::system_clock::time_point())
       {
-        _lock_guard g(this->_lock);
-        _remove_io(op);
-      }
-    }
-    // Another thread may have processed the cancellation
-    if(op->_status() == detail::io_operation_connection::status_type::scheduled)
-    {
-      op->_cancel_io();
-    }
-  }
-  virtual void _begin_io(detail::io_operation_connection *op) noexcept
-  {
-    // All handles will already be registered with IOCP, so unless the i/o
-    // is timed, there is nothing else to do
-    if(op->deadline_absolute != std::chrono::system_clock::time_point())
-    {
-      try
-      {
-        _lock_guard g(this->_lock);
         auto it = _absolutes.insert({op->deadline_absolute, op});
         if(it == _absolutes.begin())
         {
-          // Poke IOCP to wake
-          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+          need_to_wake_all = true;
         }
       }
-      catch(...)
+      else if(op->deadline_duration != std::chrono::steady_clock::time_point())
       {
-        op->_complete_io(error_from_exception());
-      }
-    }
-    else if(op->deadline_duration != std::chrono::steady_clock::time_point())
-    {
-      try
-      {
-        _lock_guard g(this->_lock);
         auto it = _durations.insert({op->deadline_duration, op});
         if(it == _durations.begin())
         {
-          // Poke IOCP to wake
-          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+          need_to_wake_all = true;
         }
       }
-      catch(...)
+    }
+    catch(...)
+    {
+      op->_complete_io(error_from_exception());
+    }
+    /* If there are run() instances running right now, wake either one of them
+    to register this handle with IOCP, or wake all of them to recalculate their
+    timers.
+    */
+    auto concurrent_run_instances = _concurrent_run_instances.load(std::memory_order_acquire);
+    if(!need_to_wake_all)
+    {
+      concurrent_run_instances = 1;
+    }
+    for(size_t n = 0; n < concurrent_run_instances; n++)
+    {
+      PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+    }
+  }
+  virtual void _deregister_pending_io(detail::io_operation_connection *op) noexcept
+  {
+    _lock_guard g(this->_lock);
+    if(op->is_registered_with_iocp)
+    {
+      windows_nt_kernel::init();
+      using namespace windows_nt_kernel;
+      IO_STATUS_BLOCK isb = make_iostatus();
+      FILE_COMPLETION_INFORMATION fci{};
+      memset(&fci, 0, sizeof(fci));
+      fci.Port = nullptr;
+      fci.Key = nullptr;
+      NTSTATUS ntstat = NtSetInformationFile(op->nativeh.h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+      if(STATUS_PENDING == ntstat)
       {
-        op->_complete_io(error_from_exception());
+        ntstat = ntwait(op->nativeh.h, isb, deadline());
+      }
+      if(ntstat < 0)
+      {
+        abort();
       }
     }
+    _remove_io(op);
   }
 };
 
