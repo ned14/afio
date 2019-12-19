@@ -110,7 +110,7 @@ public:
   //! Default constructor
   constexpr pipe_handle() {}  // NOLINT
   //! Construct a handle from a supplied native handle
-  constexpr pipe_handle(native_handle_type h, dev_t devid, ino_t inode, caching caching = caching::none, flag flags = flag::none, io_context *ctx = nullptr)
+  constexpr pipe_handle(native_handle_type h, dev_t devid, ino_t inode, caching caching = caching::none, flag flags = flag::none, io_multiplexer *ctx = nullptr)
       : io_handle(std::move(h), caching, flags, ctx)
       , fs_handle(devid, inode)
   {

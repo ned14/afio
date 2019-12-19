@@ -32,7 +32,8 @@ size_t io_handle::max_buffers() const noexcept
   return 1;  // TODO FIXME support ReadFileScatter/WriteFileGather
 }
 
-template <class BuffersType> inline void do_cancel(span<OVERLAPPED> ols, const native_handle_type& nativeh, io_handle::io_request<BuffersType> reqs) noexcept {
+template <class BuffersType> inline void do_cancel(span<OVERLAPPED> ols, const native_handle_type &nativeh, io_handle::io_request<BuffersType> reqs) noexcept
+{
   ols = span<OVERLAPPED>(ols.data(), reqs.buffers.size());
   for(auto &ol : ols)
   {
@@ -50,7 +51,7 @@ template <class BuffersType> inline void do_cancel(span<OVERLAPPED> ols, const n
   }
 }
 
-template <bool blocking, class Syscall, class BuffersType> inline io_handle::io_result<BuffersType> do_read_write(span<OVERLAPPED> ols, const native_handle_type &nativeh, Syscall &&syscall, io_handle::io_request<BuffersType> reqs, deadline d) noexcept
+template <bool blocking, class Syscall, class BuffersType> inline io_handle::io_result<BuffersType> do_read_write(span<OVERLAPPED> ols, const native_handle_type &nativeh, Syscall &&syscall, io_handle::io_request<BuffersType> reqs, deadline d, detail::io_operation_connection *op) noexcept
 {
   if(d && !nativeh.is_nonblocking())
   {
@@ -75,6 +76,7 @@ template <bool blocking, class Syscall, class BuffersType> inline io_handle::io_
   {
     OVERLAPPED &ol = *ol_it++;
     ol.Internal = static_cast<ULONG_PTR>(-1);
+    ol.hEvent = op;
     if(nativeh.is_append_only())
     {
       ol.OffsetHigh = ol.Offset = 0xffffffff;
@@ -150,14 +152,14 @@ io_handle::io_result<io_handle::buffers_type> io_handle::read(io_handle::io_requ
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   std::array<OVERLAPPED, 64> _ols{};
-  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &ReadFile, reqs, d);
+  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &ReadFile, reqs, d, nullptr);
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::io_request<io_handle::const_buffers_type> reqs, deadline d) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   std::array<OVERLAPPED, 64> _ols{};
-  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &WriteFile, reqs, d);
+  return do_read_write<true>({_ols.data(), _ols.size()}, _v, &WriteFile, reqs, d, nullptr);
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle::io_request<io_handle::const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
@@ -203,7 +205,7 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
 void io_handle::_begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
-  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &ReadFile, std::move(reqs), deadline());
+  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &ReadFile, std::move(reqs), deadline(), state);
   if(r)
   {
     // The i/o completed immediately with success
@@ -222,7 +224,7 @@ void io_handle::_begin_read(detail::io_operation_connection *state, io_request<b
 void io_handle::_begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
-  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &WriteFile, std::move(reqs), deadline());
+  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, &WriteFile, std::move(reqs), deadline(), state);
   if(r)
   {
     // The i/o completed immediately with success
@@ -246,6 +248,7 @@ void io_handle::_begin_barrier(detail::io_operation_connection *state, io_reques
   memset(&state->ols[0], 0, sizeof(OVERLAPPED));
   auto *isb = reinterpret_cast<IO_STATUS_BLOCK *>(&state->ols[0]);
   *isb = make_iostatus();
+  state->ols[0].hEvent = state;
   ULONG flags = 0;
   if(kind == barrier_kind::nowait_data_only)
   {

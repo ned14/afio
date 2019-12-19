@@ -42,7 +42,7 @@ Distributed under the Boost Software License, Version 1.0.
 LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 
 class fs_handle;
-class io_context;
+class io_multiplexer;
 
 #pragma pack(push, 4)
 
@@ -197,7 +197,7 @@ public:
 
 protected:
   // vptr takes 4 or 8 bytes
-  io_context *_ctx{nullptr};  // 8 or 16 bytes
+  io_multiplexer *_ctx{nullptr};  // 8 or 16 bytes
   native_handle_type _v;      // 16 or 28 bytes
   caching _caching{caching::none};
   uint8_t _spare1{0};       // used by pipe_handle on Windows to store connectedness
@@ -208,7 +208,7 @@ public:
   //! Default constructor
   constexpr handle() {}  // NOLINT
   //! Construct a handle from a supplied native handle
-  explicit constexpr handle(native_handle_type h, caching caching = caching::none, flag flags = flag::none, io_context *ctx = nullptr) noexcept
+  explicit constexpr handle(native_handle_type h, caching caching = caching::none, flag flags = flag::none, io_multiplexer *ctx = nullptr) noexcept
       : _ctx(ctx)
       , _v(std::move(h))
       , _caching(caching)
@@ -253,7 +253,7 @@ public:
   /*! \brief The i/o context this handle will use to multiplex i/o. If this returns null,
   then this handle has not been registered with an i/o context yet.
   */
-  io_context *multiplexer() const noexcept { return this->_ctx; }
+  io_multiplexer *multiplexer() const noexcept { return this->_ctx; }
 
   /*! Returns the current path of the open handle as said by the operating system. Note
   that you are NOT guaranteed that any path refreshed bears any resemblance to the original,

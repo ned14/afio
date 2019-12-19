@@ -154,8 +154,8 @@ static inline void TestMultiplexedPipeHandle()
   {
     while(!async_reads[n].completed())
     {
-      // Pump completions until all completed
-      multiplexer->run().value();
+      // Block until any i/o completes
+      multiplexer->wait().value();
     }
   }
   for(size_t n = 0; n < MAX_PIPES; n++)

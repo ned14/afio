@@ -22,7 +22,7 @@ Distributed under the Boost Software License, Version 1.0.
           http://www.boost.org/LICENSE_1_0.txt)
 */
 
-#include "../../io_context.hpp"
+#include "../../io_multiplexer.hpp"
 
 #include <mutex>
 
@@ -30,20 +30,20 @@ LLFIO_V2_NAMESPACE_BEGIN
 
 namespace this_thread
 {
-  static LLFIO_THREAD_LOCAL io_context *_thread_multiplexer;
-  LLFIO_HEADERS_ONLY_FUNC_SPEC io_context *multiplexer() noexcept
+  static LLFIO_THREAD_LOCAL io_multiplexer *_thread_multiplexer;
+  LLFIO_HEADERS_ONLY_FUNC_SPEC io_multiplexer *multiplexer() noexcept
   {
     if(_thread_multiplexer == nullptr)
     {
-      static auto _ = io_context::best_available(1).value();
+      static auto _ = io_multiplexer::best_available(1).value();
       _thread_multiplexer = _.get();
     }
     return _thread_multiplexer;
   }
-  LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_context *ctx) noexcept { _thread_multiplexer = ctx; }
+  LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_multiplexer *ctx) noexcept { _thread_multiplexer = ctx; }
 }  // namespace this_thread
 
-template <bool threadsafe> class io_context_impl : public io_context
+template <bool threadsafe> class io_multiplexer_impl : public io_multiplexer
 {
   struct _fake_lock_guard
   {
@@ -82,7 +82,7 @@ protected:
 
 public:
   // Lock should be held on entry!
-  virtual ~io_context_impl()
+  virtual ~io_multiplexer_impl()
   {
     if(_nonzero_items_posted)
     {
@@ -110,23 +110,23 @@ public:
   }
 };
 
-LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::best_available(size_t threads) noexcept
+LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multiplexer::best_available(size_t threads) noexcept
 {
 #ifdef __linux__
   if(threads > 1)
   {
-    return io_context::linux_epoll(threads);
+    return io_multiplexer::linux_epoll(threads);
   }
-  auto r = io_context::linux_io_uring();
+  auto r = io_multiplexer::linux_io_uring();
   if(r)
   {
     return r;
   }
-  return io_context::linux_epoll(threads);
+  return io_multiplexer::linux_epoll(threads);
 #elif defined(__FreeBSD__) || defined(__APPLE__)
-  return io_context::bsd_kqueue(threads);
+  return io_multiplexer::bsd_kqueue(threads);
 #elif defined(_WIN32)
-  return io_context::win_iocp(threads);
+  return io_multiplexer::win_iocp(threads);
 #else
 #error Unknown platform
   return errc::not_supported;
@@ -136,7 +136,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::
 LLFIO_V2_NAMESPACE_END
 
 #if defined(_WIN32)
-#include "windows/io_context.ipp"
+#include "windows/io_multiplexer.ipp"
 #else
-#include "posix/io_context.ipp"
+#include "posix/io_multiplexer.ipp"
 #endif

@@ -22,7 +22,7 @@ Distributed under the Boost Software License, Version 1.0.
           http://www.boost.org/LICENSE_1_0.txt)
 */
 
-#include "../../../io_context.hpp"
+#include "../../../io_multiplexer.hpp"
 
 #if 0
 
@@ -38,9 +38,9 @@ Distributed under the Boost Software License, Version 1.0.
 
 LLFIO_V2_NAMESPACE_BEGIN
 
-template <bool threadsafe> class linux_epoll_impl final : public io_context_impl<threadsafe>
+template <bool threadsafe> class linux_epoll_impl final : public io_multiplexer_impl<threadsafe>
 {
-  using _base = io_context_impl<threadsafe>;
+  using _base = io_multiplexer_impl<threadsafe>;
   using _lock_guard = typename _base::_lock_guard;
   using _co_read_awaitable = typename _base::template _co_read_awaitable<threadsafe>;
   using _co_write_awaitable = typename _base::template _co_write_awaitable<threadsafe>;
@@ -539,7 +539,7 @@ public:
   }
 };
 
-LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::linux_epoll(size_t threads) noexcept
+LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multiplexer::linux_epoll(size_t threads) noexcept
 {
   try
   {
@@ -562,7 +562,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::
   }
 }
 
-LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_context>> io_context::linux_io_uring() noexcept
+LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multiplexer::linux_io_uring() noexcept
 {
   return errc::not_supported;
 }

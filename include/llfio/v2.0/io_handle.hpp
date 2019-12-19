@@ -25,7 +25,7 @@ Distributed under the Boost Software License, Version 1.0.
 #ifndef LLFIO_IO_HANDLE_H
 #define LLFIO_IO_HANDLE_H
 
-#include "io_context.hpp"
+#include "io_multiplexer.hpp"
 
 //! \file io_handle.hpp Provides i/o handle
 
@@ -49,20 +49,20 @@ public:
   using creation = handle::creation;
   using caching = handle::caching;
   using flag = handle::flag;
-  using buffer_type = io_context::buffer_type;
-  using const_buffer_type = io_context::const_buffer_type;
-  using buffers_type = io_context::buffers_type;
-  using const_buffers_type = io_context::const_buffers_type;
-  template <class T> using io_request = io_context::io_request<T>;
-  template <class T> using io_result = io_context::io_result<T>;
-  using barrier_kind = io_context::barrier_kind;
+  using buffer_type = io_multiplexer::buffer_type;
+  using const_buffer_type = io_multiplexer::const_buffer_type;
+  using buffers_type = io_multiplexer::buffers_type;
+  using const_buffers_type = io_multiplexer::const_buffers_type;
+  template <class T> using io_request = io_multiplexer::io_request<T>;
+  template <class T> using io_result = io_multiplexer::io_result<T>;
+  using barrier_kind = io_multiplexer::barrier_kind;
 
 public:
   //! Default constructor
   constexpr io_handle() {}  // NOLINT
   ~io_handle() = default;
   //! Construct a handle from a supplied native handle
-  constexpr explicit io_handle(native_handle_type h, caching caching = caching::none, flag flags = flag::none, io_context *ctx = nullptr)
+  constexpr explicit io_handle(native_handle_type h, caching caching = caching::none, flag flags = flag::none, io_multiplexer *ctx = nullptr)
       : handle(h, caching, flags, ctx)
   {
   }
@@ -121,7 +121,7 @@ public:
 
   \mallocs Multiple dynamic memory allocations and deallocations.
   */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> set_multiplexer(io_context *c = this_thread::multiplexer()) noexcept
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<void> set_multiplexer(io_multiplexer *c = this_thread::multiplexer()) noexcept
   {
     if(!is_multiplexable())
     {
@@ -262,11 +262,11 @@ public:
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) noexcept;
 #if 0
   //! \brief The type for a read i/o awaitable
-  template <bool use_atomic> using co_read_awaitable = typename io_context::template _co_read_awaitable<use_atomic>;
+  template <bool use_atomic> using co_read_awaitable = typename io_multiplexer::template _co_read_awaitable<use_atomic>;
   //! \brief The type for a write i/o awaitable
-  template <bool use_atomic> using co_write_awaitable =typename io_context::template _co_write_awaitable<use_atomic>;
+  template <bool use_atomic> using co_write_awaitable =typename io_multiplexer::template _co_write_awaitable<use_atomic>;
   //! \brief The type for a barrier i/o awaitable
-  template <bool use_atomic> using co_barrier_awaitable = typename io_context::template _co_barrier_awaitable<use_atomic>;
+  template <bool use_atomic> using co_barrier_awaitable = typename io_multiplexer::template _co_barrier_awaitable<use_atomic>;
 
   /*! \brief Read data from the open handle immediately if it would not block, if so
   the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
