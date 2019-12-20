@@ -213,6 +213,7 @@ public:
       if(resume_timed_out != nullptr)
       {
         g.unlock();
+        // We need to do one more check if the i/o has completed before timing out
         resume_timed_out->poll();
         return 1;
       }
@@ -277,6 +278,7 @@ public:
         }
         auto *states = (std::vector<detail::io_operation_connection *> *) entries[n].lpCompletionKey;
         (void) states;
+        // Complete the i/o
         auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
         op->poll();
       }
