@@ -146,17 +146,17 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
       return ntkernel_error(ntstat);
     }
     ret.value()._flags |= flag::unlink_on_first_close;
-  }
-  // If opening a pipe for reading or writing, and this pipe is blocking,
-  // block until the other end opens
-  if(!path.empty() && !nativeh.is_nonblocking())
-  {
-    // Opening blocking pipes must block until other end opens
-    if(!ConnectNamedPipe(nativeh.h, nullptr))
+
+    // If creating a pipe, and this pipe is blocking, block until the other end opens
+    if(!path.empty() && !nativeh.is_nonblocking())
     {
-      return win32_error();
+      // Opening blocking pipes must block until other end opens
+      if(!ConnectNamedPipe(nativeh.h, nullptr) && ERROR_PIPE_CONNECTED != GetLastError())
+      {
+        return win32_error();
+      }
+      ret.value()._set_is_connected(true);
     }
-    ret.value()._set_is_connected(true);
   }
   return ret;
 }
@@ -205,7 +205,7 @@ pipe_handle::io_result<pipe_handle::buffers_type> pipe_handle::read(pipe_handle:
     OVERLAPPED ol{};
     memset(&ol, 0, sizeof(ol));
     ol.Internal = static_cast<ULONG_PTR>(-1);
-    if(!ConnectNamedPipe(_v.h, &ol))
+    if(!ConnectNamedPipe(_v.h, &ol) && ERROR_PIPE_CONNECTED != GetLastError())
     {
       if(ERROR_IO_PENDING != GetLastError())
       {
@@ -213,6 +213,11 @@ pipe_handle::io_result<pipe_handle::buffers_type> pipe_handle::read(pipe_handle:
       }
       if(STATUS_TIMEOUT == ntwait(_v.h, ol, d))
       {
+        if(!CancelIoEx(_v.h, &ol))
+        {
+          LLFIO_LOG_FATAL(this, "pipe_handle: Cancelling pipe connect failed");
+          abort();
+        }
         return errc::timed_out;
       }
       // It seems the NT kernel is guilty of casting bugs sometimes

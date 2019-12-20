@@ -673,7 +673,19 @@ namespace detail
           : req(std::move(_req))
       {
       }
+      storage_t(result_type _ret)
+          : ret(std::move(_ret))
+      {
+      }
       ~storage_t() {}
+      storage_t(storage_t &&o, status_type which) noexcept
+          : storage_t((which == status_type::completed) ? storage_t(std::move(o.ret)) : storage_t(std::move(o.req)))
+      {
+      }
+      storage_t(const storage_t &o, status_type which) 
+          : storage_t((which == status_type::completed) ? storage_t(o.ret) : storage_t(o.req))
+      {
+      }
     } storage;
 
   public:
@@ -684,6 +696,35 @@ namespace detail
     }
 
   protected:
+    io_sender(io_sender &&o) noexcept
+        : io_operation_connection(std::move(o))
+        , status(o.status.load(std::memory_order_acquire))
+        , storage(std::move(o.storage), status.load(std::memory_order_acquire))
+    {
+      switch(o.status.load(std::memory_order_acquire))
+      {
+      case status_type::unknown:
+        break;
+      case status_type::unscheduled:
+        // destruct req
+        o.storage.req.~request_type();
+        break;
+      case status_type::scheduled:
+        // Should never occur
+        abort();
+      case status_type::completed:
+        // destruct ret
+        o.storage.ret.~result_type();
+        break;
+      }
+      o.status.store(status_type::unknown, std::memory_order_release);
+    }
+    io_sender(const io_sender &o)
+        : io_operation_connection(o)
+        , status(o.status.load(std::memory_order_acquire))
+        , storage(o.storage, status.load(std::memory_order_acquire))
+    {
+    }
     ~io_sender()
     {
       switch(status.load(std::memory_order_acquire))
@@ -954,20 +995,18 @@ public:
       , _receiver(std::forward<_Receiver>(receiver))
   {
   }
-  io_operation_connection(const io_operation_connection &) = delete;
+  io_operation_connection(const io_operation_connection &) = default;
   io_operation_connection(io_operation_connection &&o) noexcept
       : Sender(std::move(*this))
       , _receiver(std::move(o._receiver))
   {
-    assert(o.status.load(std::memory_order_acquire) != _status_type::scheduled);
-    if(o.status.load(std::memory_order_acquire) == _status_type::scheduled)
+    assert(this->status.load(std::memory_order_acquire) != _status_type::scheduled);
+    if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
     {
       abort();
     }
-    this->status.store(o.status.load(std::memory_order_acquire), std::memory_order_release);
-    o.status.store(_status_type::unknown, std::memory_order_release);
   }
-  io_operation_connection &operator=(const io_operation_connection &) = delete;
+  io_operation_connection &operator=(const io_operation_connection &) = default;
   io_operation_connection &operator=(io_operation_connection &&o) noexcept
   {
     this->~io_operation_connection();
@@ -1131,6 +1170,8 @@ public:
   template <class Rep, class Period> _status_type poll_for(const std::chrono::duration<Rep, Period> &duration) noexcept { return poll(duration); }
   //! \overload Convenience overload for `.poll()`
   template <class Clock, class Duration> _status_type poll_until(const std::chrono::time_point<Clock, Duration> &timeout) noexcept { return poll(timeout); }
+  //! \overload Convenience overload for `.poll()`
+  _status_type poll_until_ready() noexcept { return poll({}); }
 };
 
 //! \brief Connect an `async_read` Sender with a Receiver

@@ -70,12 +70,12 @@ static inline void TestNonBlockingPipeHandle()
   namespace llfio = LLFIO_V2_NAMESPACE;
   llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
   llfio::byte buffer[64];
-  {
+  { // no writer, so non-blocking read should time out
     auto read = reader.read(0, {{buffer, 64}}, std::chrono::milliseconds(0));
     BOOST_REQUIRE(read.has_error());
     BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
   }
-  {
+  { // no writer, so blocking read should time out
     auto read = reader.read(0, {{buffer, 64}}, std::chrono::seconds(1));
     BOOST_REQUIRE(read.has_error());
     BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
@@ -83,11 +83,13 @@ static inline void TestNonBlockingPipeHandle()
   llfio::pipe_handle writer = llfio::pipe_handle::pipe_open("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
   auto written = writer.write(0, {{(const llfio::byte *) "hello", 5}}).value();
   BOOST_REQUIRE(written == 5);
-  writer.barrier().value();
-  writer.close().value();
+  // writer.barrier().value();  // would block until pipe drained by reader
+  // writer.close().value();  // would cause all further reads to fail due to pipe broken
   auto read = reader.read(0, {{buffer, 64}}, std::chrono::milliseconds(0));
   BOOST_REQUIRE(read.value() == 5);
   BOOST_CHECK(0 == memcmp(buffer, "hello", 5));
+  writer.barrier().value();  // must not block nor fail
+  writer.close().value();
   reader.close().value();
 }
 
@@ -96,7 +98,7 @@ static inline void TestMultiplexedPipeHandle()
   static constexpr size_t MAX_PIPES = 64;
   namespace llfio = LLFIO_V2_NAMESPACE;
   std::vector<llfio::pipe_handle> read_pipes, write_pipes;
-  std::vector<size_t> received_for(64);
+  std::vector<size_t> received_for(MAX_PIPES);
   struct checking_receiver
   {
     std::vector<size_t> &received_for;
@@ -124,7 +126,11 @@ static inline void TestMultiplexedPipeHandle()
         received_for[_index]++;
       }
     }
-    void set_done() { std::cout << "Cancelled!" << std::endl; }
+    void set_done()
+    {
+      std::cout << "Cancelled!" << std::endl;
+      BOOST_CHECK(false);
+    }
   };
   std::vector<llfio::io_operation_connection<llfio::async_read<llfio::pipe_handle>, checking_receiver>> async_reads;
   auto multiplexer = llfio::this_thread::multiplexer();
@@ -140,7 +146,7 @@ static inline void TestMultiplexedPipeHandle()
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     for(size_t n = MAX_PIPES - 1; n < MAX_PIPES; n--)
     {
-      write_pipes[n].write(0, {{(llfio::byte *) &n, sizeof(n)}});
+      write_pipes[n].write(0, {{(llfio::byte *) &n, sizeof(n)}}).value();
     }
   });
   // Start the connected states. They cannot move in memory until complete
@@ -152,16 +158,14 @@ static inline void TestMultiplexedPipeHandle()
   // Wait for all reads to complete
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
-    while(!async_reads[n].completed())
-    {
-      // Block until any i/o completes
-      multiplexer->wait().value();
-    }
+    // Block until this i/o completes
+    async_reads[n].poll_until_ready();
   }
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
     BOOST_CHECK(received_for[n] == 1);
   }
+  writerthread.get();
 }
 
 #if LLFIO_ENABLE_COROUTINES && 0

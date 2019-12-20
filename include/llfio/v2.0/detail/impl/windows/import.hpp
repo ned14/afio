@@ -328,7 +328,7 @@ namespace windows_nt_kernel
 
   using NtDelayExecution_t = NTSTATUS(NTAPI *)(_In_ BOOLEAN Alertable, _In_opt_ LARGE_INTEGER *Interval);
 
-  using NtRemoveIoCompletionEx_t = NTSTATUS (NTAPI *)(_In_ HANDLE IoCompletionHandle, /*PFILE_IO_COMPLETION_INFORMATION*/ LPOVERLAPPED_ENTRY IoCompletionInformation, _In_ ULONG Count, _Out_ PULONG NumEntriesRemoved, _In_opt_ PLARGE_INTEGER Timeout, _In_ BOOLEAN Alertable);
+  using NtRemoveIoCompletionEx_t = NTSTATUS(NTAPI *)(_In_ HANDLE IoCompletionHandle, /*PFILE_IO_COMPLETION_INFORMATION*/ LPOVERLAPPED_ENTRY IoCompletionInformation, _In_ ULONG Count, _Out_ PULONG NumEntriesRemoved, _In_opt_ PLARGE_INTEGER Timeout, _In_ BOOLEAN Alertable);
 
   // From https://msdn.microsoft.com/en-us/library/windows/hardware/ff566474(v=vs.85).aspx
   using NtLockFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ PLARGE_INTEGER ByteOffset, _In_ PLARGE_INTEGER Length, _In_ ULONG Key, _In_ BOOLEAN FailImmediately,
@@ -1236,6 +1236,11 @@ inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const 
 {
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
+  {
+    auto expected = static_cast<DWORD>(0x103 /*STATUS_PENDING*/);
+    // If input i/o block is i/o pending, swap that for -1
+    InterlockedCompareExchange(&isb.Status, (DWORD)-1, expected);
+  }
   LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
   do  // needs to be a do, not while in order to flip auto reset event objects etc.
   {
