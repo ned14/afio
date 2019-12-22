@@ -997,7 +997,7 @@ public:
   }
   io_operation_connection(const io_operation_connection &) = default;
   io_operation_connection(io_operation_connection &&o) noexcept
-      : Sender(std::move(*this))
+      : Sender(std::move(o))
       , _receiver(std::move(o._receiver))
   {
     assert(this->status.load(std::memory_order_acquire) != _status_type::scheduled);
@@ -1088,7 +1088,7 @@ public:
   }
   /*! \brief Poll the operation, executing completion if newly completed, returning
   immediately by default.
-  
+  
   Note that if the operation has a deadline, the current time will be fetched, which will
   involve a syscall.
 
@@ -1117,7 +1117,7 @@ public:
           bool asynchronously_completed = true;
           for(size_t n = 0; n < this->storage.req.buffers.size(); n++)
           {
-            if(this->ols[n].Internal == (size_t) -1)
+            if(this->ols[n].Internal == 0x103 /*STATUS_PENDING*/)
             {
               asynchronously_completed = false;
               break;

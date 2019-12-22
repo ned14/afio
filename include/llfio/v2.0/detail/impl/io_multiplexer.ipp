@@ -93,6 +93,7 @@ public:
         _items_posted = std::move(next);
       }
     }
+    _lock.unlock();
   }
 
   virtual void _post(function_ptr<void *(void *)> &&f) noexcept override

@@ -238,7 +238,7 @@ namespace windows_nt_kernel
     PVOID SecurityQualityOfService;
   } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
-  using PIO_APC_ROUTINE = void(NTAPI *)(IN PVOID ApcContext, IN PIO_STATUS_BLOCK IoStatusBlock, IN ULONG Reserved);
+  using PIO_APC_ROUTINE = void(NTAPI *)(_In_ PVOID ApcContext, _In_ PIO_STATUS_BLOCK IoStatusBlock, _In_ ULONG Reserved);
 
   typedef struct _IMAGEHLP_LINE64  // NOLINT
   {
@@ -296,6 +296,14 @@ namespace windows_nt_kernel
   // From http://msdn.microsoft.com/en-us/library/windows/hardware/ff566424(v=vs.85).aspx
   using NtCreateFile_t = NTSTATUS(NTAPI *)(_Out_ PHANDLE FileHandle, _In_ ACCESS_MASK DesiredAccess, _In_ POBJECT_ATTRIBUTES ObjectAttributes, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_opt_ PLARGE_INTEGER AllocationSize, _In_ ULONG FileAttributes, _In_ ULONG ShareAccess, _In_ ULONG CreateDisposition,
                                            _In_ ULONG CreateOptions, _In_opt_ PVOID EaBuffer, _In_ ULONG EaLength);
+
+  using NtReadFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event , _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _Out_ PVOID Buffer, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
+
+  using NtReadFileScatter_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event , _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ FILE_SEGMENT_ELEMENT SegmentArray, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
+
+  using NtWriteFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ PVOID Buffer, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
+
+  using NtWriteFileGather_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ FILE_SEGMENT_ELEMENT SegmentArray, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
 
   using NtDeleteFile_t = NTSTATUS(NTAPI *)(_In_ POBJECT_ATTRIBUTES ObjectAttributes);
 
@@ -599,6 +607,10 @@ namespace windows_nt_kernel
   static NtOpenDirectoryObject_t NtOpenDirectoryObject;
   static NtOpenFile_t NtOpenFile;
   static NtCreateFile_t NtCreateFile;
+  static NtReadFile_t NtReadFile;
+  static NtReadFileScatter_t NtReadFileScatter;
+  static NtWriteFile_t NtWriteFile;
+  static NtWriteFileGather_t NtWriteFileGather;
   static NtDeleteFile_t NtDeleteFile;
   static NtClose_t NtClose;
   static NtCreateNamedPipeFile_t NtCreateNamedPipeFile;
@@ -692,6 +704,34 @@ namespace windows_nt_kernel
     if(NtCreateFile == nullptr)
     {
       if((NtCreateFile = reinterpret_cast<NtCreateFile_t>(GetProcAddress(ntdllh, "NtCreateFile"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtReadFile == nullptr)
+    {
+      if((NtReadFile = reinterpret_cast<NtReadFile_t>(GetProcAddress(ntdllh, "NtReadFile"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtReadFileScatter == nullptr)
+    {
+      if((NtReadFileScatter = reinterpret_cast<NtReadFileScatter_t>(GetProcAddress(ntdllh, "NtReadFileScatter"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtWriteFile == nullptr)
+    {
+      if((NtWriteFile = reinterpret_cast<NtWriteFile_t>(GetProcAddress(ntdllh, "NtWriteFile"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtWriteFileGather == nullptr)
+    {
+      if((NtWriteFileGather = reinterpret_cast<NtWriteFileGather_t>(GetProcAddress(ntdllh, "NtWriteFileGather"))) == nullptr)
       {
         abort();
       }
@@ -1236,26 +1276,33 @@ inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const 
 {
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
+  if(isb.Status != 0x103 /*STATUS_PENDING*/)
   {
-    auto expected = static_cast<DWORD>(0x103 /*STATUS_PENDING*/);
-    // If input i/o block is i/o pending, swap that for -1
-    InterlockedCompareExchange(&isb.Status, (DWORD)-1, expected);
+    assert(isb.Status != -1);  // should not call ntwait() if operation failed to start
+    // He's done already (or never started)
+    return isb.Status;
   }
   LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
   do  // needs to be a do, not while in order to flip auto reset event objects etc.
   {
     LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);
-    // Pump alerts and APCs
-    NTSTATUS ntstat = NtWaitForSingleObject(h, 1u, timeout);
+    NTSTATUS ntstat = NtWaitForSingleObject(h, 0u, timeout);
     if(STATUS_TIMEOUT == ntstat)
     {
-      auto expected = static_cast<DWORD>(-1);
-      // Have to be very careful here, atomically swap timed out for the -1 only
-      InterlockedCompareExchange(&isb.Status, ntstat, expected);
-      // If it's no longer -1 or the i/o completes, that's fine.
+      // If he'll still pending, we must cancel the i/o
+      if(isb.Status == 0x103 /*STATUS_PENDING*/)
+      {
+        // There is a race between the above check and CancelIoEx
+        if(!CancelIoEx(h, (LPOVERLAPPED) &isb) && ERROR_NOT_FOUND != GetLastError())
+        {
+          LLFIO_LOG_FATAL(&h, "Failed to cancel i/o due to deadline timeout");
+          abort();
+        }
+        isb.Status = STATUS_TIMEOUT;
+      }
       return isb.Status;
     }
-  } while(isb.Status == -1);
+  } while(isb.Status == 0x103 /*STATUS_PENDING*/);
   return isb.Status;
 }
 inline NTSTATUS ntwait(HANDLE h, OVERLAPPED &ol, const deadline &d) noexcept

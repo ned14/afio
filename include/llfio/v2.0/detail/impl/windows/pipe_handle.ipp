@@ -31,6 +31,7 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
 {
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
+  flags &= ~flag::unlink_on_first_close;
   result<pipe_handle> ret(pipe_handle(native_handle_type(), 0, 0, _caching, flags));
   native_handle_type &nativeh = ret.value()._v;
   LLFIO_LOG_FUNCTION_CALL(&ret);
@@ -145,7 +146,6 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
     {
       return ntkernel_error(ntstat);
     }
-    ret.value()._flags |= flag::unlink_on_first_close;
 
     // If creating a pipe, and this pipe is blocking, block until the other end opens
     if(!path.empty() && !nativeh.is_nonblocking())
@@ -167,11 +167,13 @@ result<std::pair<pipe_handle, pipe_handle>> pipe_handle::anonymous_pipe(caching 
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
   // Create an unnamed new pipe
+  flags &= ~flag::unlink_on_first_close;
   OUTCOME_TRY(anonpipe, pipe({}, mode::read, creation::only_if_not_exist, _caching, flags));
   std::pair<pipe_handle, pipe_handle> ret(std::move(anonpipe), pipe_handle(native_handle_type(), 0, 0, _caching, flags));
   native_handle_type &readnativeh = ret.first._v, &writenativeh = ret.second._v;
   DWORD fileshare = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   OUTCOME_TRY(access, access_mask_from_handle_mode(writenativeh, mode::append, flags));
+  access = SYNCHRONIZE | DELETE | GENERIC_WRITE;  // correct for pipes
   OUTCOME_TRY(attribs, attributes_from_handle_caching_and_flags(writenativeh, _caching, flags));
   writenativeh.behaviour |= native_handle_type::disposition::pipe;
   writenativeh.behaviour &= ~native_handle_type::disposition::seekable;  // not seekable
@@ -182,15 +184,22 @@ result<std::pair<pipe_handle, pipe_handle>> pipe_handle::anonymous_pipe(caching 
   OUTCOME_TRY(ntflags, ntflags_from_handle_caching_and_flags(writenativeh, _caching, flags));
   IO_STATUS_BLOCK isb = make_iostatus();
 
+  UNICODE_STRING _path{};
+  memset(&_path, 0, sizeof(_path));
   OBJECT_ATTRIBUTES oa{};
   memset(&oa, 0, sizeof(oa));
   oa.Length = sizeof(OBJECT_ATTRIBUTES);
+  oa.ObjectName = &_path;
   oa.RootDirectory = readnativeh.h;
   oa.Attributes = 0x40 /*OBJ_CASE_INSENSITIVE*/;
   NTSTATUS ntstat = NtOpenFile(&writenativeh.h, access, &oa, &isb, fileshare, ntflags);
   if(STATUS_PENDING == ntstat)
   {
     ntstat = ntwait(writenativeh.h, isb, deadline());
+  }
+  if(ntstat < 0)
+  {
+    return ntkernel_error(ntstat);
   }
   return ret;
 }
@@ -213,11 +222,7 @@ pipe_handle::io_result<pipe_handle::buffers_type> pipe_handle::read(pipe_handle:
       }
       if(STATUS_TIMEOUT == ntwait(_v.h, ol, d))
       {
-        if(!CancelIoEx(_v.h, &ol))
-        {
-          LLFIO_LOG_FATAL(this, "pipe_handle: Cancelling pipe connect failed");
-          abort();
-        }
+        // ntwait cancels timed out i/o
         return errc::timed_out;
       }
       // It seems the NT kernel is guilty of casting bugs sometimes

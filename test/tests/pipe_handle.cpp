@@ -70,12 +70,12 @@ static inline void TestNonBlockingPipeHandle()
   namespace llfio = LLFIO_V2_NAMESPACE;
   llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
   llfio::byte buffer[64];
-  { // no writer, so non-blocking read should time out
+  {  // no writer, so non-blocking read should time out
     auto read = reader.read(0, {{buffer, 64}}, std::chrono::milliseconds(0));
     BOOST_REQUIRE(read.has_error());
     BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
   }
-  { // no writer, so blocking read should time out
+  {  // no writer, so blocking read should time out
     auto read = reader.read(0, {{buffer, 64}}, std::chrono::seconds(1));
     BOOST_REQUIRE(read.has_error());
     BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
@@ -146,12 +146,17 @@ static inline void TestMultiplexedPipeHandle()
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     for(size_t n = MAX_PIPES - 1; n < MAX_PIPES; n--)
     {
-      write_pipes[n].write(0, {{(llfio::byte *) &n, sizeof(n)}}).value();
+      auto r = write_pipes[n].write(0, {{(llfio::byte *) &n, sizeof(n)}});
+      if(!r)
+      {
+        abort();
+      }
     }
   });
   // Start the connected states. They cannot move in memory until complete
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
+    async_reads[n].receiver().buffer = {async_reads[n].receiver()._buffer, sizeof(async_reads[n].receiver()._buffer)};
     async_reads[n].sender().request() = {{async_reads[n].receiver().buffer}, 0};
     async_reads[n].start();
   }

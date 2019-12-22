@@ -45,13 +45,15 @@ situation are implementation defined. Linux and Windows support fully
 duplex pipes, and the Windows implementation matches the Linux bespoke
 semantics.
 
-When you create a named pipe, `flag::unlink_on_first_close` is
-always forced on. This is due to portability reasons -
+For the static functions which create a pipe, `flag::unlink_on_first_close`
+is the default. This is due to portability reasons -
 on some platforms (e.g. Windows), named pipes always get deleted when
 the last handle to them is closed in the system, so the closest
-matching semantic is for the creating handle to unlink its creation on
-first close on all platforms. If you don't want this, release the native
-handle before closing the handle instance, and take over its management.
+matching semantic on POSIX is for the creating handle to unlink its creation on
+first close on all platforms. If you don't want this, change the flags
+given during creation. Note that on Windows, `flag::unlink_on_first_close`
+is always masked out, this is because Windows appears to not permit
+renaming nor unlinking of open pipes.
 
 If `flag::multiplexable` is specified which causes the handle to
 be created as `native_handle_type::disposition::nonblocking`, opening
@@ -165,7 +167,7 @@ public:
   is specified, this will block until the other end connects.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  static inline result<pipe_handle> pipe_create(path_view_type path, caching _caching = caching::all, flag flags = flag::none, const path_handle &base = path_discovery::temporary_named_pipes_directory()) noexcept { return pipe(path, mode::read, creation::if_needed, _caching, flags, base); }
+  static inline result<pipe_handle> pipe_create(path_view_type path, caching _caching = caching::all, flag flags = flag::unlink_on_first_close, const path_handle &base = path_discovery::temporary_named_pipes_directory()) noexcept { return pipe(path, mode::read, creation::if_needed, _caching, flags, base); }
   /*! Convenience overload for `pipe()` opening an existing named pipe
   with write-only privileges. This will fail if no reader is waiting
   on the other end of the pipe.
@@ -180,7 +182,7 @@ public:
   \errors Any of the values POSIX `open()`, `mkfifo()`, `NtCreateFile()` or `NtCreateNamedPipeFile()` can return.
   */
   LLFIO_MAKE_FREE_FUNCTION
-  static inline result<pipe_handle> random_pipe(mode _mode = mode::read, caching _caching = caching::all, flag flags = flag::none, const path_handle &dirpath = path_discovery::temporary_named_pipes_directory()) noexcept
+  static inline result<pipe_handle> random_pipe(mode _mode = mode::read, caching _caching = caching::all, flag flags = flag::unlink_on_first_close, const path_handle &dirpath = path_discovery::temporary_named_pipes_directory()) noexcept
   {
     try
     {

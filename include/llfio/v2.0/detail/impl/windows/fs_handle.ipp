@@ -204,8 +204,9 @@ result<void> fs_handle::unlink(deadline d) noexcept
     if(h.is_symlink())
       ntflags |= 0x00200000 /*FILE_OPEN_REPARSE_POINT*/;
     NTSTATUS ntstat = NtOpenFile(&duph, SYNCHRONIZE | DELETE, &oa, &isb, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ntflags);
-    // Can't duplicate the handle of a pipe not in the listening state
-    if(ntstat < 0 && !h.is_pipe())
+    // Note that Windows appears to not permit renaming nor deletion of pipe handles right now,
+    // so do nothing about the STATUS_PIPE_NOT_AVAILABLE failure here
+    if(ntstat < 0)
     {
       return ntkernel_error(ntstat);
     }
@@ -232,7 +233,7 @@ result<void> fs_handle::unlink(deadline d) noexcept
   }
   if(failed)
   {
-    if((h.is_regular() || h.is_symlink() || h.is_pipe()) && !(h.flags() & flag::win_disable_unlink_emulation))
+    if((h.is_regular() || h.is_symlink()) && !(h.flags() & flag::win_disable_unlink_emulation))
     {
       // Rename it to something random to emulate immediate unlinking
       std::string randomname;
