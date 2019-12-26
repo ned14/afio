@@ -297,15 +297,17 @@ namespace windows_nt_kernel
   using NtCreateFile_t = NTSTATUS(NTAPI *)(_Out_ PHANDLE FileHandle, _In_ ACCESS_MASK DesiredAccess, _In_ POBJECT_ATTRIBUTES ObjectAttributes, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_opt_ PLARGE_INTEGER AllocationSize, _In_ ULONG FileAttributes, _In_ ULONG ShareAccess, _In_ ULONG CreateDisposition,
                                            _In_ ULONG CreateOptions, _In_opt_ PVOID EaBuffer, _In_ ULONG EaLength);
 
-  using NtReadFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event , _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _Out_ PVOID Buffer, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
+  using NtReadFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _Out_ PVOID Buffer, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
 
-  using NtReadFileScatter_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event , _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ FILE_SEGMENT_ELEMENT SegmentArray, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
+  using NtReadFileScatter_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ FILE_SEGMENT_ELEMENT SegmentArray, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
 
   using NtWriteFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ PVOID Buffer, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
 
   using NtWriteFileGather_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ FILE_SEGMENT_ELEMENT SegmentArray, _In_ ULONG Length, _In_opt_ PLARGE_INTEGER ByteOffset, _In_opt_ PULONG Key);
 
   using NtDeleteFile_t = NTSTATUS(NTAPI *)(_In_ POBJECT_ATTRIBUTES ObjectAttributes);
+
+  using NtCancelIoFileEx_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _Out_ PIO_STATUS_BLOCK IoRequestToCancel, _Out_ PIO_STATUS_BLOCK IoStatusBlock);
 
   using NtClose_t = NTSTATUS(NTAPI *)(_Out_ HANDLE FileHandle);
 
@@ -611,6 +613,7 @@ namespace windows_nt_kernel
   static NtReadFileScatter_t NtReadFileScatter;
   static NtWriteFile_t NtWriteFile;
   static NtWriteFileGather_t NtWriteFileGather;
+  static NtCancelIoFileEx_t NtCancelIoFileEx;
   static NtDeleteFile_t NtDeleteFile;
   static NtClose_t NtClose;
   static NtCreateNamedPipeFile_t NtCreateNamedPipeFile;
@@ -732,6 +735,13 @@ namespace windows_nt_kernel
     if(NtWriteFileGather == nullptr)
     {
       if((NtWriteFileGather = reinterpret_cast<NtWriteFileGather_t>(GetProcAddress(ntdllh, "NtWriteFileGather"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtCancelIoFileEx == nullptr)
+    {
+      if((NtCancelIoFileEx = reinterpret_cast<NtCancelIoFileEx_t>(GetProcAddress(ntdllh, "NtCancelIoFileEx"))) == nullptr)
       {
         abort();
       }
@@ -1271,6 +1281,33 @@ inline windows_nt_kernel::IO_STATUS_BLOCK make_iostatus() noexcept
   return isb;
 }
 
+inline NTSTATUS ntcancel_pending_io(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb) noexcept
+{
+  windows_nt_kernel::init();
+  using namespace windows_nt_kernel;
+  if(isb.Status != 0x103 /*STATUS_PENDING*/)
+  {
+    return isb.Status;
+  }
+  NTSTATUS ntstat = NtCancelIoFileEx(h, &isb, &isb);
+  if(ntstat < 0)
+  {
+    if(ntstat == 0xC0000225 /*STATUS_NOT_FOUND*/)
+    {
+      // In the moment between the check of isb.Status and NtCancelIoFileEx()
+      // the i/o completed, so consider this a success.
+      isb.Status = 0xC0000120 /*STATUS_CANCELLED*/;
+      return isb.Status;
+    }
+    return ntstat;
+  }
+  if(isb.Status == 0)
+  {
+    isb.Status = 0xC0000120 /*STATUS_CANCELLED*/;
+  }
+  return isb.Status;
+}
+
 // Wait for an overlapped handle to complete a specific operation
 inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const deadline &d) noexcept
 {
@@ -1290,17 +1327,14 @@ inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const 
     if(STATUS_TIMEOUT == ntstat)
     {
       // If he'll still pending, we must cancel the i/o
-      if(isb.Status == 0x103 /*STATUS_PENDING*/)
+      ntstat = ntcancel_pending_io(h, isb);
+      if(ntstat<0 && ntstat != 0xC0000120 /*STATUS_CANCELLED*/)
       {
-        // There is a race between the above check and CancelIoEx
-        if(!CancelIoEx(h, (LPOVERLAPPED) &isb) && ERROR_NOT_FOUND != GetLastError())
-        {
-          LLFIO_LOG_FATAL(&h, "Failed to cancel i/o due to deadline timeout");
-          abort();
-        }
-        isb.Status = STATUS_TIMEOUT;
+        LLFIO_LOG_FATAL(nullptr, "Failed to cancel earlier i/o");
+        abort();
       }
-      return isb.Status;
+      isb.Status = ntstat = STATUS_TIMEOUT;
+      return ntstat;
     }
   } while(isb.Status == 0x103 /*STATUS_PENDING*/);
   return isb.Status;

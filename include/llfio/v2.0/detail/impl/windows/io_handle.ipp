@@ -32,21 +32,25 @@ size_t io_handle::max_buffers() const noexcept
   return 1;  // TODO FIXME support ReadFileScatter/WriteFileGather
 }
 
-template <class BuffersType> inline void do_cancel(span<OVERLAPPED> ols, const native_handle_type &nativeh, io_handle::io_request<BuffersType> reqs) noexcept
+template <class BuffersType> inline bool do_cancel(span<OVERLAPPED> ols, const native_handle_type &nativeh, io_handle::io_request<BuffersType> reqs) noexcept
 {
+  using namespace windows_nt_kernel;
+  bool did_cancel = false;
   ols = span<OVERLAPPED>(ols.data(), reqs.buffers.size());
   for(auto &ol : ols)
   {
-    if(ol.Internal == 0x103 /*STATUS_PENDING*/)
+    NTSTATUS ntstat = ntcancel_pending_io(nativeh.h, (IO_STATUS_BLOCK &) ol);
+    if(ntstat < 0 && ntstat != 0xC0000120 /*STATUS_CANCELLED*/)
     {
-      // There is a race between the above check and CancelIoEx
-      if(!CancelIoEx(nativeh.h, (LPOVERLAPPED) &ol) && ERROR_NOT_FOUND != GetLastError())
-      {
-        LLFIO_LOG_FATAL(nullptr, "Failed to cancel earlier i/o due to i/o failure");
-        abort();
-      }
+      LLFIO_LOG_FATAL(nullptr, "Failed to cancel earlier i/o");
+      abort();
+    }
+    if(ntstat == 0xC0000120 /*STATUS_CANCELLED*/)
+    {
+      did_cancel = true;
     }
   }
+  return did_cancel;
 }
 
 template <bool blocking, class Syscall, class BuffersType> inline io_handle::io_result<BuffersType> do_read_write(span<OVERLAPPED> ols, const native_handle_type &nativeh, Syscall &&syscall, io_handle::io_request<BuffersType> reqs, deadline d, detail::io_operation_connection *op) noexcept
@@ -217,122 +221,126 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
   return {reqs.buffers};
 }
 
-void io_handle::_begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept
+const detail::io_operation_visitor &io_handle::_get_async_io_visitor() noexcept
 {
-  windows_nt_kernel::init();
-  using namespace windows_nt_kernel;
-  LLFIO_LOG_FUNCTION_CALL(this);
-  if(reqs.buffers.empty())
+  static struct _ final : public detail::io_operation_visitor
   {
-    // The i/o completed immediately with success
-    state->_complete_io(result<size_t>(0));
-    return;
-  }
-  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, NtReadFile, std::move(reqs), deadline(), state);
-  if(!r)
-  {
-    // The i/o completed immediately with failure
-    state->_complete_io(result<size_t>(r.error()));
-    return;
-  }
-  if(!r.value().empty())
-  {
-    // The i/o completed immediately with success
-    state->_complete_io(result<size_t>(0));
-    return;
-  }
-  // No need to register i/o for IOCP unless it is deadlined
-  if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
-  {
-    state->ctx->_register_pending_io(state);
-  }
-}
-
-void io_handle::_begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept
-{
-  windows_nt_kernel::init();
-  using namespace windows_nt_kernel;
-  LLFIO_LOG_FUNCTION_CALL(this);
-  if(reqs.buffers.empty())
-  {
-    // The i/o completed immediately with success
-    state->_complete_io(result<size_t>(0));
-    return;
-  }
-  auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, NtWriteFile, std::move(reqs), deadline(), state);
-  if(!r)
-  {
-    // The i/o completed immediately with failure
-    state->_complete_io(result<size_t>(r.error()));
-    return;
-  }
-  if(!r.value().empty())
-  {
-    // The i/o completed immediately with success
-    state->_complete_io(result<size_t>(0));
-    return;
-  }
-  // No need to register i/o for IOCP unless it is deadlined
-  if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
-  {
-    state->ctx->_register_pending_io(state);
-  }
-}
-
-void io_handle::_begin_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> /*unused*/, barrier_kind kind) noexcept
-{
-  windows_nt_kernel::init();
-  using namespace windows_nt_kernel;
-  LLFIO_LOG_FUNCTION_CALL(this);
-  memset(&state->ols[0], 0, sizeof(OVERLAPPED));
-  auto *isb = reinterpret_cast<IO_STATUS_BLOCK *>(&state->ols[0]);
-  *isb = make_iostatus();
-  state->ols[0].hEvent = state;
-  ULONG flags = 0;
-  if(kind == barrier_kind::nowait_data_only)
-  {
-    flags = 1 /*FLUSH_FLAGS_FILE_DATA_ONLY*/;  // note this doesn't block
-  }
-  else if(kind == barrier_kind::nowait_all)
-  {
-    flags = 2 /*FLUSH_FLAGS_NO_SYNC*/;
-  }
-  NTSTATUS ntstat = NtFlushBuffersFileEx(state->nativeh.h, flags, nullptr, 0, isb);
-  if(STATUS_PENDING == ntstat)
-  {
-    // No need to register i/o for IOCP unless it is deadlined
-    if(state->deadline_absolute != std::chrono::system_clock::time_point() || state->deadline_duration != std::chrono::steady_clock::time_point())
+    void begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) const noexcept override
     {
+      windows_nt_kernel::init();
+      using namespace windows_nt_kernel;
+      LLFIO_LOG_FUNCTION_CALL(this);
+      if(reqs.buffers.empty())
+      {
+        // The i/o completed immediately with success
+        state->_complete_io(result<size_t>(0));
+        return;
+      }
+      auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, NtReadFile, std::move(reqs), deadline(), state);
+      if(!r)
+      {
+        // The i/o completed immediately with failure
+        state->_complete_io(result<size_t>(r.error()));
+        return;
+      }
+      if(!r.value().empty())
+      {
+        // The i/o completed immediately with success
+        state->_complete_io(result<size_t>(0));
+        return;
+      }
       state->ctx->_register_pending_io(state);
     }
-    return;
-  }
-  if(ntstat < 0)
-  {
-    // The i/o completed immediately with failure
-    state->_complete_io(result<size_t>(ntkernel_error(ntstat)));
-    return;
-  }
-  // The i/o completed immediately with success. Pass through the buffers unmodified
-  state->_complete_io(result<size_t>((size_t) -1));
-}
 
-void io_handle::_cancel_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept
-{
-  LLFIO_LOG_FUNCTION_CALL(this);
-  do_cancel({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, std::move(reqs));
-}
+    void begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) const noexcept override
+    {
+      windows_nt_kernel::init();
+      using namespace windows_nt_kernel;
+      LLFIO_LOG_FUNCTION_CALL(this);
+      if(reqs.buffers.empty())
+      {
+        // The i/o completed immediately with success
+        state->_complete_io(result<size_t>(0));
+        return;
+      }
+      auto r = do_read_write<false>({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, NtWriteFile, std::move(reqs), deadline(), state);
+      if(!r)
+      {
+        // The i/o completed immediately with failure
+        state->_complete_io(result<size_t>(r.error()));
+        return;
+      }
+      if(!r.value().empty())
+      {
+        // The i/o completed immediately with success
+        state->_complete_io(result<size_t>(0));
+        return;
+      }
+      state->ctx->_register_pending_io(state);
+    }
 
-void io_handle::_cancel_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept
-{
-  LLFIO_LOG_FUNCTION_CALL(this);
-  do_cancel({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, std::move(reqs));
-}
+    void begin_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> /*unused*/, barrier_kind kind) const noexcept override
+    {
+      windows_nt_kernel::init();
+      using namespace windows_nt_kernel;
+      LLFIO_LOG_FUNCTION_CALL(this);
+      memset(&state->ols[0], 0, sizeof(OVERLAPPED));
+      auto *isb = reinterpret_cast<IO_STATUS_BLOCK *>(&state->ols[0]);
+      *isb = make_iostatus();
+      state->ols[0].hEvent = state;
+      ULONG flags = 0;
+      if(kind == barrier_kind::nowait_data_only)
+      {
+        flags = 1 /*FLUSH_FLAGS_FILE_DATA_ONLY*/;  // note this doesn't block
+      }
+      else if(kind == barrier_kind::nowait_all)
+      {
+        flags = 2 /*FLUSH_FLAGS_NO_SYNC*/;
+      }
+      NTSTATUS ntstat = NtFlushBuffersFileEx(state->nativeh.h, flags, nullptr, 0, isb);
+      if(STATUS_PENDING == ntstat)
+      {
+        state->ctx->_register_pending_io(state);
+        return;
+      }
+      if(ntstat < 0)
+      {
+        // The i/o completed immediately with failure
+        state->_complete_io(result<size_t>(ntkernel_error(ntstat)));
+        return;
+      }
+      // The i/o completed immediately with success. Pass through the buffers unmodified
+      state->_complete_io(result<size_t>((size_t) -1));
+    }
 
-void io_handle::_cancel_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> /*unused*/, barrier_kind /*unused*/) noexcept
-{
-  LLFIO_LOG_FUNCTION_CALL(this);
-  do_cancel({(OVERLAPPED *) state->ols, 1}, state->nativeh, io_request<const_buffers_type>{{nullptr, 0}, 0});
+    void cancel_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) const noexcept override
+    {
+      LLFIO_LOG_FUNCTION_CALL(this);
+      if(do_cancel({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, std::move(reqs)))
+      {
+        state->is_cancelled_io = true;
+      }
+    }
+
+    void cancel_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) const noexcept override
+    {
+      LLFIO_LOG_FUNCTION_CALL(this);
+      if(do_cancel({(OVERLAPPED *) state->ols, state->max_overlappeds}, state->nativeh, std::move(reqs)))
+      {
+        state->is_cancelled_io = true;
+      }
+    }
+
+    void cancel_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> /*unused*/, barrier_kind /*unused*/) const noexcept override
+    {
+      LLFIO_LOG_FUNCTION_CALL(this);
+      if(do_cancel({(OVERLAPPED *) state->ols, 1}, state->nativeh, io_request<const_buffers_type>{{nullptr, 0}, 0}))
+      {
+        state->is_cancelled_io = true;
+      }
+    }
+  } visitor;
+  return visitor;
 }
 
 LLFIO_V2_NAMESPACE_END

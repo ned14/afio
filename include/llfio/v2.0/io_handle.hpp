@@ -1,5 +1,5 @@
 /* A handle to something
-(C) 2015-2017 Niall Douglas <http://www.nedproductions.biz/> (20 commits)
+(C) 2015-2019 Niall Douglas <http://www.nedproductions.biz/> (20 commits)
 File Created: Dec 2015
 
 
@@ -254,23 +254,11 @@ public:
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _begin_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_read(detail::io_operation_connection *state, io_request<buffers_type> reqs) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_write(detail::io_operation_connection *state, io_request<const_buffers_type> reqs) noexcept;
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _cancel_barrier(detail::io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) noexcept;
-#if 0
-  //! \brief The type for a read i/o awaitable
-  template <bool use_atomic> using co_read_awaitable = typename io_multiplexer::template _co_read_awaitable<use_atomic>;
-  //! \brief The type for a write i/o awaitable
-  template <bool use_atomic> using co_write_awaitable =typename io_multiplexer::template _co_write_awaitable<use_atomic>;
-  //! \brief The type for a barrier i/o awaitable
-  template <bool use_atomic> using co_barrier_awaitable = typename io_multiplexer::template _co_barrier_awaitable<use_atomic>;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC const detail::io_operation_visitor &_get_async_io_visitor() noexcept;
 
-  /*! \brief Read data from the open handle immediately if it would not block, if so
-  the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
-  awaitable shall become ready when the i/o has completed.
+  /*! \brief Return a non-threadsafe coroutine awaitable which when awaited upon,
+  begins the i/o. If the i/o completes immediately, the coroutine is never suspended.
+  Otherwise the coroutine is suspended until the i/o completes.
 
   This function will always fail if `.is_multiplexable()` is false for this handle.
 
@@ -280,14 +268,21 @@ public:
   the current thread's i/o context, which is a non-deterministic operation. To avoid
   that, call `.set_multiplexer()` manually from cold code.
   */
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<async_read, V> co_read(V &&v, io_request<buffers_type> reqs, deadline d = deadline()) noexcept { return io_awaitable<async_read, V>(async_read(*this, reqs, d), std::forward<V>(v)); }
+  //! \overload Same as before, but returning threadsafe awaitables instead.
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_read> co_read_atomic(V &&v, io_request<buffers_type> reqs, deadline d = deadline()) noexcept { return io_awaitable<atomic_async_read, V>(atomic_async_read(*this, reqs, d), std::forward<V>(v)); }
+  //! \overload
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_read_awaitable<false> co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept;
+  io_awaitable<async_read> co_read(io_request<buffers_type> reqs, deadline d = deadline()) noexcept { return co_read<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, d); }
+  //! \overload
+  LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_read> co_read_atomic(io_request<buffers_type> reqs, deadline d = deadline()) noexcept { return co_read_atomic<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, d); }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_read)
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_read_atomic)
 
-  /*! \brief Write data to the open handle immediately if it would not block, if so
-  the returned awaitable will be immediately ready. Otherwise begin the i/o, and the
-  awaitable shall become ready when the i/o has completed.
+  /*! \brief Return a non-threadsafe coroutine awaitable which when awaited upon,
+  begins the i/o. If the i/o completes immediately, the coroutine is never suspended.
+  Otherwise the coroutine is suspended until the i/o completes.
 
   This function will always fail if `.is_multiplexable()` is false for this handle.
 
@@ -297,14 +292,23 @@ public:
   the current thread's i/o context, which is a non-deterministic operation. To avoid
   that, call `.set_multiplexer()` manually from cold code.
   */
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<async_write, V> co_write(V &&v, io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept { return io_awaitable<async_write, V>(async_write(*this, reqs, d), std::forward<V>(v)); }
+  //! \overload Same as before, but returning threadsafe awaitables instead.
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_write> co_write_atomic(V &&v, io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept { return io_awaitable<atomic_async_write, V>(atomic_async_write(*this, reqs, d), std::forward<V>(v)); }
+  //! \overload
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_write_awaitable<false> co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept;
+  io_awaitable<async_write> co_write(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept { return co_write<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, d); }
+  //! \overload
+  LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_write> co_write_atomic(io_request<const_buffers_type> reqs, deadline d = deadline()) noexcept { return co_write_atomic<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, d); }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_write)
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_write_atomic)
 
-  /*! \brief Begin the issuing of a write reordering barrier such that writes
-  preceding the barrier will reach storage before writes after this barrier completes.
-  This operation almost never completes immediately.
+  /*! \brief Return a non-threadsafe coroutine awaitable which when awaited upon,
+  begins the i/o. If the i/o completes immediately, the coroutine is never suspended.
+  Otherwise the coroutine is suspended until the i/o completes. Some multiplexer
+  implementations do not implement async barriers, and for those platforms this call
+  will fail.
 
   This function will always fail if `.is_multiplexable()` is false for this handle.
 
@@ -314,11 +318,26 @@ public:
   the current thread's i/o context, which is a non-deterministic operation. To avoid
   that, call `.set_multiplexer()` manually from cold code.
   */
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<async_barrier, V> co_barrier(V &&v, io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept
+  {
+    return io_awaitable<async_barrier, V>(async_barrier(*this, reqs, kind, d), std::forward<V>(v));
+  }
+  //! \overload Same as before, but returning threadsafe awaitables instead.
+  template <class V> LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_barrier> co_barrier_atomic(V &&v, io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept
+  {
+    return io_awaitable<atomic_async_barrier, V>(atomic_async_barrier(*this, reqs, kind, d), std::forward<V>(v));
+  }
+  //! \overload
   LLFIO_MAKE_FREE_FUNCTION
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC co_barrier_awaitable<false> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept;
+  io_awaitable<async_barrier> co_barrier(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept { return co_barrier<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, kind, d); }
+  //! \overload
+  LLFIO_MAKE_FREE_FUNCTION io_awaitable<atomic_async_barrier> co_barrier_atomic(io_request<const_buffers_type> reqs = io_request<const_buffers_type>(), barrier_kind kind = barrier_kind::nowait_data_only, deadline d = deadline()) noexcept
+  {
+    return co_barrier_atomic<detail::null_io_awaitable_visitor>(detail::null_io_awaitable_visitor(), reqs, kind, d);
+  }
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier)
-#endif
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(co_barrier_atomic)
 };
 
 

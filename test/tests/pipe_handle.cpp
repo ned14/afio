@@ -25,6 +25,7 @@ Distributed under the Boost Software License, Version 1.0.
 #include "../test_kernel_decl.hpp"
 
 #include <future>
+#include <unordered_set>
 
 static inline void TestBlockingPipeHandle()
 {
@@ -132,13 +133,13 @@ static inline void TestMultiplexedPipeHandle()
       BOOST_CHECK(false);
     }
   };
-  std::vector<llfio::io_operation_connection<llfio::async_read<llfio::pipe_handle>, checking_receiver>> async_reads;
+  std::vector<llfio::io_operation_connection<llfio::async_read, checking_receiver>> async_reads;
   auto multiplexer = llfio::this_thread::multiplexer();
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
     auto ret = llfio::pipe_handle::anonymous_pipe(llfio::pipe_handle::caching::reads, llfio::pipe_handle::flag::multiplexable).value();
     ret.first.set_multiplexer(multiplexer).value();
-    async_reads.push_back(llfio::connect(llfio::async_read<llfio::pipe_handle>(ret.first), checking_receiver(received_for)));
+    async_reads.push_back(llfio::connect(llfio::async_read(ret.first), checking_receiver(received_for)));
     read_pipes.push_back(std::move(ret.first));
     write_pipes.push_back(std::move(ret.second));
   }
@@ -164,7 +165,10 @@ static inline void TestMultiplexedPipeHandle()
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
     // Block until this i/o completes
-    async_reads[n].poll_until_ready();
+    while(async_reads[n].poll() == llfio::io_state_status::scheduled)
+    {
+      llfio::this_thread::multiplexer()->run().value();
+    }
   }
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
@@ -173,89 +177,125 @@ static inline void TestMultiplexedPipeHandle()
   writerthread.get();
 }
 
-#if LLFIO_ENABLE_COROUTINES && 0
+#if LLFIO_ENABLE_COROUTINES
 static inline void TestCoroutinedPipeHandle()
 {
+  static constexpr size_t MAX_PIPES = 70;
   namespace llfio = LLFIO_V2_NAMESPACE;
-  auto coro = []() -> OUTCOME_V2_NAMESPACE::awaitables::eager<void> {
-    llfio::pipe_handle reader = llfio::pipe_handle::pipe_create("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
-    llfio::byte buffer[64];
-    llfio::pipe_handle::buffer_type buffer1{buffer, 64}, buffer2{buffer, 64};
-    // Start two parallel reads
-    auto read1a = reader.co_read({{buffer1}, 0}, std::chrono::milliseconds(0));
-    auto read2a = reader.co_read({{buffer2}, 0}, std::chrono::seconds(1));
-    // Await on the first, who should be immediately ready due to zero deadline
-    {
-      BOOST_CHECK(read1a.await_ready());
-      auto read = co_await read1a;
-      BOOST_REQUIRE(read.has_error());
-      BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
-    }
-    // Await on the second, who should not be ready and should force a call to multiplexer()->run()
-    {
-      BOOST_CHECK(!read2a.await_ready());
-      auto read = co_await read2a;
-      BOOST_REQUIRE(read.has_error());
-      BOOST_REQUIRE(read.error() == llfio::errc::timed_out);
-    }
-    llfio::pipe_handle writer = llfio::pipe_handle::pipe_open("llfio-pipe-handle-test", llfio::pipe_handle::caching::all, llfio::pipe_handle::flag::multiplexable).value();
-    llfio::pipe_handle::const_buffer_type buffer3{(const llfio::byte *) "hello", 5};
-    auto written = co_await writer.co_write({{buffer3}, 0});
-    BOOST_REQUIRE(written.bytes_transferred() == 5);
-    (co_await writer.co_barrier()).value();
-    writer.close().value();
-    buffer1 = {buffer, 64};
-    auto read = co_await reader.co_read({{buffer1}, 0}, std::chrono::milliseconds(0));
-    BOOST_REQUIRE(read.bytes_transferred() == 5);
-    BOOST_CHECK(0 == memcmp(buffer, "hello", 5));
-    reader.close().value();
-  };
-  auto a = coro();  // launch the coroutine
-  while(!a.await_ready())
+  struct io_visitor
   {
-    std::cout << "Coroutine is not ready, resuming it ..." << std::endl;
-    a.await_suspend({});  // pump it every time it suspends
-  }
-  a.await_resume();  // fetch its result
-}
-#endif
+    using container_type = std::unordered_set<llfio::io_awaitable<llfio::async_read, io_visitor> *>;
+    container_type &c;
+    void await_suspend(container_type::value_type i) { c.insert(i); }
+    void await_resume(container_type::value_type i) { c.erase(i); }
+  };
+  io_visitor::container_type io_pending;
+  struct coroutine
+  {
+    llfio::pipe_handle read_pipe, write_pipe;
+    size_t received_for{0};
 
-#if 0
-      // This i/o is registered, pump completions until my coroutine resumes.
-      // He will resume my coroutine if its deadline expires. We need to set
-      // the result we would normally set if we returned normally, as we will
-      // never return normally
-      aw->_ret = {success()};
-      bool found = true;
-      while(found)
+    explicit coroutine(llfio::pipe_handle &&r, llfio::pipe_handle &&w)
+        : read_pipe(std::move(r))
+        , write_pipe(std::move(w))
+    {
+    }
+    llfio::eager<llfio::result<void>> operator()(io_visitor::container_type &io_pending)
+    {
+      union {
+        llfio::byte _buffer[sizeof(size_t)];
+        size_t _index;
+      };
+      llfio::pipe_handle::buffer_type buffer;
+      for(;;)
       {
-        g.unlock();
-        auto r = run();  // to infinity, though it may return
-        g.lock();
-        found = false;
-        for(auto &i : it->second.io_outstanding)
-        {
-          if(i.co == co)
-          {
-            found = true;
-            if(!r)
-            {
-              _remove_io(it, i);
-              break;
-            }
-          }
-        }
+        buffer = {_buffer, sizeof(_buffer)};
+        // This will never return if the coroutine gets cancelled
+        auto r = co_await read_pipe.co_read(io_visitor{io_pending}, {{buffer}, 0});
         if(!r)
         {
-          return r.error();
+          co_return r.error();
+        }
+        BOOST_CHECK(r.value().size() == 1);
+        BOOST_CHECK(r.value()[0].size() == sizeof(_buffer));
+        ++received_for;
+      }
+    }
+  };
+  std::vector<coroutine> coroutines;
+  auto multiplexer = llfio::this_thread::multiplexer();
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    auto ret = llfio::pipe_handle::anonymous_pipe(llfio::pipe_handle::caching::reads, llfio::pipe_handle::flag::multiplexable).value();
+    ret.first.set_multiplexer(multiplexer).value();
+    coroutines.push_back(coroutine(std::move(ret.first), std::move(ret.second)));
+  }
+  // Start the coroutines, all of whom will begin a read and then suspend
+  std::vector<llfio::optional<llfio::eager<llfio::result<void>>>> states(MAX_PIPES);
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    states[n].emplace(coroutines[n](io_pending));
+  }
+  // Write to all the pipes, then pump coroutine resumption until all completions done
+  for(size_t i = 0; i < 10; i++)
+  {
+    for(size_t n = MAX_PIPES - 1; n < MAX_PIPES; n--)
+    {
+      coroutines[n].write_pipe.write(0, {{(llfio::byte *) &i, sizeof(i)}}).value();
+    }
+    // Take a copy of all pending i/o
+    std::vector<io_visitor::container_type::value_type> copy(io_pending.begin(), io_pending.end());
+    for(;;)
+    {
+      // Manually check if an i/o completion is ready, avoiding any syscalls
+      bool need_to_poll = true;
+      for(auto it = copy.begin(); it != copy.end();)
+      {
+        if((*it)->await_ready())
+        {
+          need_to_poll = false;
+          it = copy.erase(it);
+          std::cout << "Completed an i/o without syscall" << std::endl;
+        }
+        else
+          ++it;
+      }
+      if(need_to_poll)
+      {
+        // Have the kernel tell me when an i/o completion is ready
+        auto r = multiplexer->poll();
+        BOOST_CHECK(r.value() != 0);
+        if(r.value() < 0)
+        {
+          for(size_t n = 0; n < MAX_PIPES; n++)
+          {
+            BOOST_CHECK(coroutines[n].received_for == i + 1);
+          }
+          break;
         }
       }
-      return success();
+    }
+  }
+  // Rethrow any failures
+  for(size_t n = 0; n < MAX_PIPES; n++)
+  {
+    if(states[n]->await_ready())
+    {
+      states[n]->await_resume().value();
+    }
+  }
+  // Destruction of coroutines when they are suspended must work.
+  // This will cancel any pending i/o and immediately exit the
+  // coroutines
+  states.clear();
+  // Now clear all the coroutines
+  coroutines.clear();
+}
 #endif
 
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, blocking, "Tests that blocking llfio::pipe_handle works as expected", TestBlockingPipeHandle())
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, nonblocking, "Tests that nonblocking llfio::pipe_handle works as expected", TestNonBlockingPipeHandle())
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, multiplexed, "Tests that multiplexed llfio::pipe_handle works as expected", TestMultiplexedPipeHandle())
-#if LLFIO_ENABLE_COROUTINES && 0
+#if LLFIO_ENABLE_COROUTINES
 KERNELTEST_TEST_KERNEL(integration, llfio, pipe_handle, coroutined, "Tests that coroutined llfio::pipe_handle works as expected", TestCoroutinedPipeHandle())
 #endif

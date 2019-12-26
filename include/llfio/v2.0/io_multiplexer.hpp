@@ -41,9 +41,6 @@ namespace detail
   struct io_operation_connection;
 }
 
-template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type;
-template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable;
-
 /*! \class io_multiplexer
 \brief An i/o multiplexer context.
 
@@ -62,29 +59,24 @@ will be unusually expensive.
 For all i/o multiplexer implementations, `.post()` is guaranteed to be
 threadsafe. You can use this to post work from other kernel threads
 to be executed by the i/o multiplexer by any current or next call to
-`.wait()` as soon as possible. Be aware that if nobody calls `.wait()`
+`.run()` as soon as possible. Be aware that if nobody calls `.run()`
 or `.check_posted_items()`, posted work is never executed.
 
 For all i/o multiplexer implementations, no dynamic memory allocations
-occur during i/o unless you call `.wait()`. If `threads` is less than or
+occur during i/o unless you call `.run()` or `.check_deadlined_io()`. If `threads` is less than or
 equal to `1`, no locking occurs during i/o either. This makes multiplexed
 i/o very low overhead. It is effectively a spinlooped polling implementation
 by default.
 
-The price paid for very low overhead i/o is that `.wait()` must be a very
-expensive call involving many syscalls and dynamic
-memory allocations and multiple mutex lock/unlock cycles. This is because
-all previously unseen pending i/o must be registered into the OS kernel's
-reactor, the earliest expiring timeout i/o calculated, and the blocking
-wait executed. Once an i/o is registered, when the i/o completes it will
-introduce overhead to deregister that i/o with the OS kernel, which will introduce extra
-overhead on completions of all pending i/o at the time of blocking. For
-most use cases, this is a very desirable tradeoff.
-
-Be aware that if you ever call `.check_deadlined_io()` or `.wait()`, i/o
+Be aware that if you ever call `.check_deadlined_io()` or `.run()`, i/o
 with a non-zero non-infinite deadline is slightly more
 expensive than zero or infinite deadlined i/o, as all pending i/o must be
 ordered into a coherent list in order to calculate the earliest expiring i/o.
+This list is cached between runs, which means that completion of deadlined
+i/o will cause a dynamic memory free per completed deadlined i/o. No dynamic
+memory allocation occurs for deadlined i/o if `.check_deadlined_io()` or `.run()`
+is never called, however additional syscalls to check the current time will
+occur.
 
 For some use cases where all kernel thread sleeps are unacceptable, you want
 an exclusively non-blocking i/o implementation.
@@ -96,7 +88,7 @@ i/o which has timed out, and other threads manually `.poll()` on the
 connection states for completion on an as-needed basis.
 
 Finally, be aware that `.poll_for()` and `.poll_until()` on the connection
-state, if given a timeout later than now, will call `.wait()` on the
+state, if given a timeout later than now, will call `.run()` on the
 associated multiplexer, looping it until the connection state completes
 either via i/o completion or time out.
 
@@ -108,14 +100,14 @@ varying tradeoffs. Some of the implementations take a `threads`
 parameter. If `> 1`, the implementation returned can handle more
 than one thread using the same instance at a time. In this situation,
 receivers are invoked in the next available idle thread
-blocked within `.wait()`.
+blocked within `.run()`.
 
-`.wait()` returns when at least one i/o completion or post was processed.
+`.run()` returns when at least one i/o completion or post was processed.
 This enables you to sleep the kernel thread until some i/o completes
 somewhere, and then to ask `.completed()` on your connected i/o state to
 see if it has completed. The `.poll_for()`, `.poll_until()` and `.poll_until_ready()`
-calls are convenience wrappers of `.wait()` which do this for you.
-For improved efficiency, some of the `.wait()` implementations will process
+calls are convenience wrappers of `.run()` which do this for you.
+For improved efficiency, some of the `.run()` implementations will process
 many completions at a time, and will return the number processed.
 
 ### Linux
@@ -183,7 +175,6 @@ non-seekable devices are currently supported.
 class LLFIO_DECL io_multiplexer
 {
   friend class io_handle;
-  template <class Cont, bool use_atomic> friend class io_awaitable;
 
 protected:
   native_handle_type _v;
@@ -465,9 +456,16 @@ public:
   */
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<bool> check_deadlined_io() noexcept = 0;
 
-  /*! \brief Calls `check_posted_items()` and `check_deadlined_io()`, returning `1`
-  if either returned true. If neither, registers any previously unseen pending i/o
-  with the operating system for state change notifications and waits for the first
+private:
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> _do_run(bool nonblocking, deadline d) noexcept = 0;
+
+public:
+  /*! \brief Block up to the deadline specified waiting for posted items, i/o
+  to complete, or i/o to time out.
+
+  Calls `check_posted_items()` and `check_deadlined_io()`, returning `1`
+  if either returned true. If there are no posted items and no pending i/o and
+  there is a zero deadline, returns zero. Otherwise, waits for the first pending
   i/o to signal. For all i/o reported by the operating system to have completed,
   invokes the completion of their Receivers. Returns the number of i/o completed;
   `errc::timed_out` if the deadline passed.
@@ -475,8 +473,15 @@ public:
   \mallocs Many dynamic memory allocations and syscalls and mutex lock-unlock cycles
   may be performed. This is a non-deterministic function.
   */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<size_t> wait(deadline d = deadline()) noexcept = 0;
-  LLFIO_DEADLINE_TRY_FOR_UNTIL(wait)
+  result<int> run(deadline d = deadline()) noexcept { return _do_run(false, d);
+  }
+  LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
+
+  /*! \overload Convenience non-blocking overload for `run()`. Returns a negative
+  number if no completions nor posts currently available; a non-zero positive number
+  if a posted item was executed or completion processed; zero if no pending i/o remains.
+  */
+  result<int> poll() noexcept { return _do_run(true, {}); }
 
 protected:
   constexpr io_multiplexer() {}
@@ -562,17 +567,35 @@ namespace this_thread
   LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_multiplexer *ctx) noexcept;
 }  // namespace this_thread
 
+//! \brief The status type for an i/o connection state
+enum class io_state_status
+{
+  unknown,      //!< This i/o connection state is uninitialised or moved from
+  unscheduled,  //!< This i/o connection state has been connected but not started
+  scheduled,    //!< This i/o connection state has been started but has not completed
+  completed     //!< This i/o connection state has completed
+};
+
 namespace detail
 {
+  struct io_operation_visitor
+  {
+    template <class T> using io_request = io_multiplexer::io_request<T>;
+    using buffers_type = io_multiplexer::buffers_type;
+    using const_buffers_type = io_multiplexer::const_buffers_type;
+    using barrier_kind = io_multiplexer::barrier_kind;
+
+    virtual ~io_operation_visitor() {}
+    virtual void begin_read(io_operation_connection *state, io_request<buffers_type> reqs) const noexcept = 0;
+    virtual void begin_write(io_operation_connection *state, io_request<const_buffers_type> reqs) const noexcept = 0;
+    virtual void begin_barrier(io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) const noexcept = 0;
+    virtual void cancel_read(io_operation_connection *state, io_request<buffers_type> reqs) const noexcept = 0;
+    virtual void cancel_write(io_operation_connection *state, io_request<const_buffers_type> reqs) const noexcept = 0;
+    virtual void cancel_barrier(io_operation_connection *state, io_request<const_buffers_type> reqs, barrier_kind kind) const noexcept = 0;
+  };
   struct io_operation_connection
   {
-    enum class status_type
-    {
-      unknown,
-      unscheduled,
-      scheduled,
-      completed
-    };
+    using status_type = io_state_status;
 #ifdef _WIN32
     static constexpr size_t max_overlappeds = 64;
 #endif
@@ -606,14 +629,18 @@ namespace detail
     io_multiplexer *ctx;
     native_handle_type nativeh;
     deadline d;
-    bool is_added_to_deadline_list{false};
+    const io_operation_visitor &handle_visitor;
     bool is_registered_with_io_multiplexer{false};
+    bool is_added_to_deadline_list{false};
+    bool is_cancelled_io{false};
 
   protected:
-    io_operation_connection(handle &h, deadline d)
+    template <class HandleType>
+    io_operation_connection(HandleType &h, deadline d)
         : ctx(h.multiplexer())
         , nativeh(h.native_handle())
         , d(d)
+        , handle_visitor(h._get_async_io_visitor())
     {
     }
     virtual ~io_operation_connection() {}
@@ -628,7 +655,7 @@ namespace detail
     virtual void cancel() noexcept { abort(); }
     // Called by anyone to cause the checking for i/o completion or
     // timed out, and if so, to complete the i/o
-    virtual status_type poll(deadline /*unused*/ = std::chrono::seconds(0)) noexcept { abort(); }
+    virtual status_type poll() noexcept { abort(); }
   };
 
   template <class T> class fake_atomic
@@ -642,6 +669,8 @@ namespace detail
     }
     T load(std::memory_order /*unused*/) const { return _v; }
     void store(T v, std::memory_order /*unused*/) { _v = v; }
+    void fetch_add(T v, std::memory_order /*unused*/) { _v += v; }
+    void fetch_sub(T v, std::memory_order /*unused*/) { _v -= v; }
   };
   struct fake_mutex
   {
@@ -650,11 +679,10 @@ namespace detail
   };
   LLFIO_HEADERS_ONLY_FUNC_SPEC error_info ntkernel_error_from_overlapped(size_t);
 
-  template <class HandleType, bool use_atomic> struct io_sender : public io_operation_connection
+  template <class BuffersType, bool use_atomic> struct io_sender : public io_operation_connection
   {
-    using handle_type = HandleType;
     static constexpr bool is_atomic = use_atomic;
-    using buffers_type = typename io_multiplexer::buffers_type;
+    using buffers_type = BuffersType;
     using request_type = typename io_multiplexer::io_request<buffers_type>;
     using result_type = typename io_multiplexer::io_result<buffers_type>;
     using error_type = typename result_type::error_type;
@@ -682,14 +710,15 @@ namespace detail
           : storage_t((which == status_type::completed) ? storage_t(std::move(o.ret)) : storage_t(std::move(o.req)))
       {
       }
-      storage_t(const storage_t &o, status_type which) 
+      storage_t(const storage_t &o, status_type which)
           : storage_t((which == status_type::completed) ? storage_t(o.ret) : storage_t(o.req))
       {
       }
     } storage;
 
   public:
-    io_sender(handle_type &h, request_type req = {}, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
+    template <class HandleType>
+    io_sender(HandleType &h, request_type req = {}, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
         : io_operation_connection(h, d)
         , storage(req)
     {
@@ -842,73 +871,68 @@ namespace detail
 }  // namespace detail
 
 //! \brief A Sender of a non-atomic async read i/o on a handle
-LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
-LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
-struct async_read : protected detail::io_sender<HandleType, use_atomic>
+template <bool use_atomic> struct async_read_sender : protected detail::io_sender<typename io_multiplexer::buffers_type, use_atomic>
 {
-  using detail::io_sender<HandleType, use_atomic>::io_sender;
-  using detail::io_sender<HandleType, use_atomic>::request;
-  using detail::io_sender<HandleType, use_atomic>::deadline;
+  using _base = detail::io_sender<typename io_multiplexer::buffers_type, use_atomic>;
+  using result_type = typename io_multiplexer::template io_result<typename io_multiplexer::buffers_type>;
+  using _base::deadline;
+  using _base::io_sender;
+  using _base::request;
 
 protected:
   void _begin_io() noexcept
   {
     // Begin a read
-    HandleType temp(this->nativeh, 0, 0);
-    temp._begin_read(this, this->storage.req);
-    temp.release();
+    this->handle_visitor.begin_read(this, this->storage.req);
   }
   void _cancel_io() noexcept
   {
     // Cancel a read
-    HandleType temp(this->nativeh, 0, 0);
-    temp._cancel_read(this, this->storage.req);
-    temp.release();
+    this->handle_visitor.cancel_read(this, this->storage.req);
   }
 };
+//! \brief A Sender of an async read i/o on a handle
+using async_read = async_read_sender<false>;
 //! \brief A Sender of an atomic async read i/o on a handle
-template <class HandleType> using atomic_async_read = async_read<HandleType, true>;
+using atomic_async_read = async_read_sender<true>;
 
 //! \brief A Sender of a non-atomic async write i/o on a handle
-LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
-LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
-struct async_write : protected detail::io_sender<HandleType, use_atomic>
+template <bool use_atomic> struct async_write_sender : protected detail::io_sender<typename io_multiplexer::const_buffers_type, use_atomic>
 {
-  using detail::io_sender<HandleType, use_atomic>::io_sender;
-  using detail::io_sender<HandleType, use_atomic>::request;
-  using detail::io_sender<HandleType, use_atomic>::deadline;
+  using _base = detail::io_sender<typename io_multiplexer::const_buffers_type, use_atomic>;
+  using result_type = typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>;
+  using _base::deadline;
+  using _base::io_sender;
+  using _base::request;
 
 protected:
   void _begin_io() noexcept
   {
     // Begin a write
-    HandleType temp(this->nativeh, 0, 0);
-    temp._begin_write(this, this->storage.req);
-    temp.release();
+    this->handle_visitor.begin_write(this, this->storage.req);
   }
   void _cancel_io() noexcept
   {
     // Cancel a write
-    HandleType temp(this->nativeh, 0, 0);
-    temp._cancel_write(this, this->storage.req);
-    temp.release();
+    this->handle_visitor.cancel_write(this, this->storage.req);
   }
 };
+//! \brief A Sender of an async write i/o on a handle
+using async_write = async_write_sender<false>;
 //! \brief A Sender of an atomic async write i/o on a handle
-template <class HandleType> using atomic_async_write = async_write<HandleType, true>;
+using atomic_async_write = async_write_sender<true>;
 
 //! \brief A Sender of a non-atomic async barrier i/o on a handle
-LLFIO_TEMPLATE(class HandleType, bool use_atomic = false)
-LLFIO_TREQUIRES(LLFIO_TPRED(std::is_base_of<io_handle, HandleType>::value))
-class async_barrier : protected detail::io_sender<HandleType, use_atomic>
+template <bool use_atomic> class async_barrier_sender : protected detail::io_sender<typename io_multiplexer::const_buffers_type, use_atomic>
 {
-  using _base = detail::io_sender<HandleType, use_atomic>;
-  using request_type = typename _base::request_type;
-  using status_type = typename _base::status_type;
+  using _base = detail::io_sender<typename io_multiplexer::const_buffers_type, use_atomic>;
   using barrier_kind = typename io_multiplexer::barrier_kind;
   barrier_kind _kind;
 
 public:
+  using status_type = typename _base::status_type;
+  using request_type = typename io_multiplexer::template io_request<typename io_multiplexer::const_buffers_type>;
+  using result_type = typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>;
   using _base::deadline;
   using _base::io_sender;
   using _base::request;
@@ -926,7 +950,8 @@ public:
     return _kind;
   }
 
-  explicit async_barrier(handle &h, request_type req = {}, barrier_kind kind = barrier_kind::nowait_data_only, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
+  template <class HandleType>
+  explicit async_barrier_sender(HandleType &h, request_type req = {}, barrier_kind kind = barrier_kind::nowait_data_only, LLFIO_V2_NAMESPACE::deadline d = LLFIO_V2_NAMESPACE::deadline())
       : _base(h, req, d)
       , _kind(kind)
   {
@@ -936,20 +961,18 @@ protected:
   void _begin_io() noexcept
   {
     // Begin a barrier
-    HandleType temp(this->nativeh, 0, 0);
-    temp._begin_barrier(this, this->storage.req, _kind);
-    temp.release();
+    this->handle_visitor.begin_barrier(this, this->storage.req, _kind);
   }
   void _cancel_io() noexcept
   {
     // Cancel a barrier
-    HandleType temp(this->nativeh, 0, 0);
-    temp._cancel_barrier(this, this->storage.req, _kind);
-    temp.release();
+    this->handle_visitor.cancel_barrier(this, this->storage.req, _kind);
   }
 };
+//! \brief A Sender of an async barrier i/o on a handle
+using async_barrier = async_barrier_sender<false>;
 //! \brief A Sender of an atomic async barrier i/o on a handle
-template <class HandleType> using atomic_async_barrier = async_barrier<HandleType, true>;
+using atomic_async_barrier = async_barrier_sender<true>;
 
 /*! \brief The i/o operation connection state type.
 
@@ -958,20 +981,19 @@ i/o completes. Doing so will terminate the process.
 */
 template <class Sender, class Receiver>                                          //
 LLFIO_REQUIRES(std::is_base_of<detail::io_operation_connection, Sender>::value)  //
-class io_operation_connection final : protected Sender
+class io_operation_connection : protected Sender
 {
   static_assert(std::is_base_of<detail::io_operation_connection, Sender>::value, "Sender type is not an i/o sender type");
 
 public:
   using sender_type = Sender;
   using receiver_type = Receiver;
-  using handle_type = typename sender_type::handle_type;
   static constexpr bool is_atomic = sender_type::is_atomic;
   using request_type = typename sender_type::request_type;
   using result_type = typename sender_type::result_type;
   using error_type = typename sender_type::error_type;
 
-private:
+protected:
   using _status_type = typename sender_type::status_type;
   using _lock_guard = typename sender_type::lock_guard;
   Receiver _receiver;
@@ -1014,7 +1036,23 @@ public:
     return *this;
   }
   //! If the i/o is started and not completed, will call `.cancel()`, which may block.
-  ~io_operation_connection() { cancel(); }
+  ~io_operation_connection() {
+    if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
+    {
+      _lock_guard g(this->lock);
+      if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
+      {
+        this->_cancel_io();
+        //sender_type::_create_result(errc::operation_canceled);
+        sender_type::_create_result((size_t)-1);  // suppress all the error log messages
+        // Set cancelled. We cannot set value, for a coroutine receiver
+        // that would resume the coroutine, and this destructor may be being
+        // called because the coroutine frame is being destroyed. Reentering
+        // the coroutine in this circumstance is bad.
+        _receiver.set_done();
+      }
+    }
+  }
 
   using Sender::completed;
   using Sender::multiplexer;
@@ -1082,365 +1120,230 @@ public:
         this->_cancel_io();
         sender_type::_create_result(errc::operation_canceled);
         // Set cancelled
-        _receiver.set_done();
+        _receiver.set_value(std::move(this->storage.ret));
       }
     }
   }
-  /*! \brief Poll the operation, executing completion if newly completed, returning
-  immediately by default.
-  
-  Note that if the operation has a deadline, the current time will be fetched, which will
-  involve a syscall.
-
-  If the deadline is not zero, a loop of calling the associated multiplexer's `.wait()`
-  function is performed, not returning until either the time out expires, or the i/o
-  completes.
-  */
-  virtual _status_type poll(deadline d = deadline(std::chrono::seconds(0))) noexcept override final
+  /*! \brief Poll the operation, executing completion if newly completed, without blocking.
+   */
+  virtual _status_type poll() noexcept override final
   {
     _status_type ret = this->status.load(std::memory_order_acquire);
     if(ret == _status_type::scheduled)
     {
-      LLFIO_DEADLINE_TO_SLEEP_INIT(d);
-      do
+      _lock_guard g(this->lock);
+      ret = this->status.load(std::memory_order_acquire);  // check after lock grant
+      if(ret == _status_type::scheduled)
       {
+#ifdef _WIN32
+        // The OVERLAPPED structures can complete asynchronously. If they
+        // have completed, complete i/o right now.
+        bool asynchronously_completed = true;
+        for(size_t n = 0; n < this->storage.req.buffers.size(); n++)
         {
-          _lock_guard g(this->lock);
-          ret = this->status.load(std::memory_order_acquire);  // check after lock grant
-          if(ret != _status_type::scheduled)
+          if(this->ols[n].Internal == 0x103 /*STATUS_PENDING*/)
           {
+            asynchronously_completed = false;
             break;
           }
-#ifdef _WIN32
-          // The OVERLAPPED structures can complete asynchronously. If they
-          // have completed, complete i/o right now.
-          bool asynchronously_completed = true;
-          for(size_t n = 0; n < this->storage.req.buffers.size(); n++)
+        }
+        if(asynchronously_completed)
+        {
+          _complete_io(result<size_t>(0));
+          return _status_type::completed;
+        }
+#endif
+        // Have I timed out?
+        if(this->deadline_absolute != std::chrono::system_clock::time_point())
+        {
+          if(std::chrono::system_clock::now() >= this->deadline_absolute)
           {
-            if(this->ols[n].Internal == 0x103 /*STATUS_PENDING*/)
-            {
-              asynchronously_completed = false;
-              break;
-            }
-          }
-          if(asynchronously_completed)
-          {
-            _complete_io(result<size_t>(0));
+            this->_cancel_io();
+            _complete_io(errc::timed_out);
             return _status_type::completed;
           }
-#endif
-          // Have I timed out?
-          if(this->deadline_absolute != std::chrono::system_clock::time_point())
-          {
-            if(std::chrono::system_clock::now() >= this->deadline_absolute)
-            {
-              this->_cancel_io();
-              _complete_io(errc::timed_out);
-              return _status_type::completed;
-            }
-          }
-          else if(this->deadline_duration != std::chrono::steady_clock::time_point())
-          {
-            if(std::chrono::steady_clock::now() >= this->deadline_duration)
-            {
-              this->_cancel_io();
-              _complete_io(errc::timed_out);
-              return _status_type::completed;
-            }
-          }
-          if(d && d.nsecs == 0)
-          {
-            break;
-          }
         }
-        deadline nd;
-        LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
-        auto r = this->ctx->wait(nd);
-        if(!r)
+        else if(this->deadline_duration != std::chrono::steady_clock::time_point())
         {
-          char buffer[256];
-          snprintf(buffer, sizeof(buffer), "io_operation_connection::poll() fails to blocking wait due to %s", r.error().message().c_str());
-          LLFIO_LOG_WARN(nullptr, buffer);
+          if(std::chrono::steady_clock::now() >= this->deadline_duration)
+          {
+            this->_cancel_io();
+            _complete_io(errc::timed_out);
+            return _status_type::completed;
+          }
         }
-      } while(ret == _status_type::scheduled);
+      }
     }
     return ret;
   }
-  //! \overload Convenience overload for `.poll()`
-  template <class Rep, class Period> _status_type poll_for(const std::chrono::duration<Rep, Period> &duration) noexcept { return poll(duration); }
-  //! \overload Convenience overload for `.poll()`
-  template <class Clock, class Duration> _status_type poll_until(const std::chrono::time_point<Clock, Duration> &timeout) noexcept { return poll(timeout); }
-  //! \overload Convenience overload for `.poll()`
-  _status_type poll_until_ready() noexcept { return poll({}); }
 };
 
 //! \brief Connect an `async_read` Sender with a Receiver
-LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                                              //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::buffers_type>>())),  //
+LLFIO_TEMPLATE(bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(  //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::buffers_type>>())), //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
-auto connect(async_read<HandleType, use_atomic> &&sender, Receiver &&receiver)
+auto connect(async_read_sender<use_atomic> &&sender, Receiver &&receiver)
 {
-  return io_operation_connection<async_read<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+  return io_operation_connection<async_read_sender<use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
 }
 
 //! \brief Connect an `async_write` Sender with a Receiver
-LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                                                    //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::const_buffers_type>>())),  //
+LLFIO_TEMPLATE(bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(  //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())), //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
-auto connect(async_write<HandleType, use_atomic> &&sender, Receiver &&receiver)
+auto connect(async_write_sender<use_atomic> &&sender, Receiver &&receiver)
 {
-  return io_operation_connection<async_write<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+  return io_operation_connection<async_write_sender<use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
 }
 
 //! \brief Connect an `async_barrier` Sender with a Receiver
-LLFIO_TEMPLATE(class HandleType, bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(                                                                                                                                    //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename HandleType::template io_result<typename HandleType::const_buffers_type>>())),  //
+LLFIO_TEMPLATE(bool use_atomic, class Receiver)
+LLFIO_TREQUIRES(  //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())), //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
-auto connect(async_barrier<HandleType, use_atomic> &&sender, Receiver &&receiver)
+auto connect(async_barrier_sender<use_atomic> &&sender, Receiver &&receiver)
 {
-  return io_operation_connection<async_barrier<HandleType, use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
+  return io_operation_connection<async_barrier_sender<use_atomic>, Receiver>(std::move(sender), std::forward<Receiver>(receiver));
 }
 
-#if 0  // disabled until we reimplement the awaitables around Sender-Receiver
-//! \brief The promise type for an i/o awaitable
-template <class Awaitable, bool use_atomic> struct io_awaitable_promise_type
+namespace detail
 {
-  using awaitable_type = Awaitable;
-  using container_type = typename io_multiplexer::template io_result<typename Awaitable::container_type>;
-  using result_set_type = std::conditional_t<use_atomic, std::atomic<bool>, OUTCOME_V2_NAMESPACE::awaitables::detail::template fake_atomic<bool>>;
-  // Constructor used by coroutines
-  io_awaitable_promise_type() {}
-  // Constructor used by co_read|co_write|co_barrier
-  io_awaitable_promise_type(handle *_h, typename io_multiplexer::template io_request<typename Awaitable::container_type> _reqs)
-      : ctx(_h->multiplexer())
-      , nativeh(_h->native_handle())
-      , reqs(_reqs)
+  struct null_io_awaitable_visitor
   {
-  }
-  io_awaitable_promise_type(const io_awaitable_promise_type &) = delete;
-  io_awaitable_promise_type(io_awaitable_promise_type &&o) noexcept
-      : result_set(o.result_set.load(std::memory_order_relaxed))
-      , extra_in_use(o.extra_in_use)
-      , ctx(o.ctx)
-      , internal_reference(o.internal_reference)
-      , nativeh(o.nativeh)
-      , reqs(o.reqs)
-  {
-    if(result_set.load(std::memory_order_acquire))
-    {
-      new(&result.value) container_type(static_cast<container_type &&>(o.result.value));
-    }
-    o.ctx = nullptr;
-    if(1 == extra_in_use)
-    {
-#ifdef _WIN32
-      memcpy(extra.ols, o.extra.ols, sizeof(extra.ols));
-#else
-      new(&extra.erased_op) function_ptr<container_type(io_awaitable_promise_type & p), 2 * sizeof(void *)>(std::move(o.extra.erased_op));
-#endif
-    }
-  }
-  io_awaitable_promise_type &operator=(const io_awaitable_promise_type &) = delete;
-  io_awaitable_promise_type &operator=(io_awaitable_promise_type &&) = delete;
-  ~io_awaitable_promise_type()
-  {
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.value.~container_type();
-    }
-#ifndef _WIN32
-    if(1 == extra_in_use)
-    {
-      extra.erased_op.~function_ptr<container_type(io_awaitable_promise_type & p), 2 * sizeof(void *)>();
-    }
-#endif
-  }
-  auto get_return_object() { return Awaitable{this}; }
-  void return_value(container_type &&value)
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.value.~container_type();
-    }
-    new(&result.value) container_type(static_cast<container_type &&>(value));
-    result_set.store(true, std::memory_order_release);
-  }
-  void return_value(const container_type &value)
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.value.~container_type();
-    }
-    new(&result.value) container_type(value);
-    result_set.store(true, std::memory_order_release);
-  }
-  void unhandled_exception()
-  {
-    assert(!result_set.load(std::memory_order_acquire));
-    if(result_set.load(std::memory_order_acquire))
-    {
-      result.value.~container_type();
-    }
-#ifdef __cpp_exceptions
-    auto e = std::current_exception();
-    auto ec = OUTCOME_V2_NAMESPACE::awaitables::detail::error_from_exception(static_cast<decltype(e) &&>(e), {});
-    // Try to set error code first
-    if(!OUTCOME_V2_NAMESPACE::awaitables::detail::error_is_set(ec) || !OUTCOME_V2_NAMESPACE::awaitables::detail::try_set_error(ec, &result.value))
-    {
-      OUTCOME_V2_NAMESPACE::awaitables::detail::set_or_rethrow(e, &result.value);
-    }
-#else
-    std::terminate();
-#endif
-    result_set.store(true, std::memory_order_release);
-  }
-  auto initial_suspend() noexcept
-  {
-    struct awaiter
-    {
-      bool await_ready() noexcept { return true; }
-      void await_resume() noexcept {}
-      void await_suspend(
-#if LLFIO_ENABLE_COROUTINES
-      coroutine_handle<> /*unused*/
-#endif
-      )
-      {
-      }
-    };
-    return awaiter{};
-  }
-  auto final_suspend()
-  {
-    struct awaiter
-    {
-      bool await_ready() noexcept { return true; }
-      void await_resume() noexcept {}
-      void await_suspend(
-#if LLFIO_ENABLE_COROUTINES
-      coroutine_handle<> /*unused*/
-#endif
-      )
-      {
-      }
-    };
-    return awaiter{};
-  }
-};
-
-/*! \brief An i/o awaitable type, where the operation is attempted immediately,
-and if it can be completed immediately without blocking then the awaitable is returned ready.
-If it must block, the calling coroutine is suspended and the awaitable is returned not ready.
-If one then awaits on the i/o awaitable, `multiplexer()->run()` is looped until the
-i/o completes.
-*/
-template <class Cont, bool use_atomic> class OUTCOME_NODISCARD io_awaitable
-{
-  template <class Awaitable, bool use_atomic_> friend struct io_awaitable_promise_type;
-
-public:
-  using promise_type = io_awaitable_promise_type<io_awaitable, use_atomic>;
-
-private:
-  using container_type = Cont;
-  union {
-    OUTCOME_V2_NAMESPACE::detail::empty_type _default{};
-    typename io_multiplexer::template io_result<container_type> _immediate_result;
+    template <class T> void await_suspend(T * /*unused*/) {}
+    template <class T> void await_resume(T * /*unused*/) {}
   };
-  promise_type *_p{nullptr};
+
+  template <class ResultType> struct io_awaitable_receiver_type
+  {
+    ResultType *result{nullptr};
+#if LLFIO_ENABLE_COROUTINES
+    coroutine_handle<> coro;
+#endif
+    void set_value(ResultType &&res)
+    {
+      result = &res;
+#if LLFIO_ENABLE_COROUTINES
+      if(coro)
+      {
+        coro.resume();
+      }
+#endif
+    }
+    void set_done() {}
+  };
+}  // namespace detail
+
+/*! \brief A convenience wrapper of `async_read`, `async_write` and `async_barrier`
+into a coroutine awaitable.
+
+`io_handle` provides these convenience wrapper functions returning this awaitable type:
+
+- `.co_read()` and `.co_read_atomic()`.
+- `.co_write()` and `.co_write_atomic()`.
+- `.co_barrier()` and `.co_barrier_atomic()`.
+
+Upon first `.await_ready()`, the awaitable begins the i/o. If the i/o completes immediately,
+the awaitable is immediately ready and no coroutine suspension occurs.
+
+If the i/o does not complete immediately, the coroutine is suspended. Subsequent calls
+to `.await_ready()` call `.poll()` on the i/o connection state, which checks if the i/o
+has completed without blocking. If the i/o completes, the coroutine is resumed.
+
+For many users, to pump all pending i/o with completions in a set of coroutines scheduled
+on the current kernel thread would look something like this:
+
+\begincode
+auto multiplexer = llfio::this_thread::multiplexer();
+while(multiplexer->poll().value() > 0);
+\endcode
+
+This will resume any suspended coroutines as the i/o they are blocked against
+completes. When the current thread's multiplexer has no i/o completions left
+to process, `poll()` will return less than zero and the loop will exit.
+
+`poll()` never sleeps the thread, so if in fact you want to pump all pending i/o until
+there is no more pending i/o at all, you would do instead:
+
+\begincode
+auto multiplexer = llfio::this_thread::multiplexer();
+while(multiplexer->run().value() > 0);
+\endcode
+
+If there are no i/o completions to process, but there is pending i/o, `run()` will
+sleep the kernel thread until an i/o completes. When there is no pending i/o for
+this multiplexer, `run()` returns with `0`.
+
+Both `poll()` and `run()` are by their nature expensive calls. To provide a
+mechanism by which a pure volatile checking spin loop can be conveniently
+constructed, i/o awaitables can configured with a vistor whose
+`.await_suspend(io_awaitable *)` is called when the coroutine is suspended,
+and whose `.await_resume(io_awaitable *)` is called when the coroutine is resumed.
+This lets you accumulate sublists of i/o awaitables into a container which can
+be spin loop iterated, calling `.await_ready()` on each i/o awaitable.
+*/
+template <class SenderType, class Visitor = detail::null_io_awaitable_visitor> class OUTCOME_NODISCARD io_awaitable : protected io_operation_connection<SenderType, detail::io_awaitable_receiver_type<typename SenderType::result_type>>
+{
+  using _base = io_operation_connection<SenderType, detail::io_awaitable_receiver_type<typename SenderType::result_type>>;
+  using _sender_type = SenderType;
+  using _receiver_type = detail::io_awaitable_receiver_type<typename SenderType::result_type>;
+  using _result_type = typename _sender_type::result_type;
+  using _lock_guard = typename _base::lock_guard;
+  Visitor _visitor;
 
 public:
-  io_awaitable(io_awaitable &&o) noexcept
-      : _p(o._p)
+  explicit io_awaitable(_sender_type &&sender, Visitor &&visitor = {})
+      : _base(connect(std::move(sender), _receiver_type()))
+      , _visitor(std::move(visitor))
   {
-    o._p = nullptr;
-    if(_p == nullptr)
-    {
-      new(&_immediate_result) typename io_multiplexer::template io_result<container_type>(static_cast<typename io_multiplexer::template io_result<container_type> &&>(o._immediate_result));
-    }
   }
-  io_awaitable(const io_awaitable &o) = delete;
+  io_awaitable(io_awaitable &&) = default;
+  io_awaitable(const io_awaitable &o) = default;
   io_awaitable &operator=(io_awaitable &&) = delete;  // as per P1056
-  io_awaitable &operator=(const io_awaitable &) = delete;
-  ~io_awaitable()
-  {
-    if(_p == nullptr)
-    {
-      _immediate_result.~io_result<container_type>();
-    }
-    else
-    {
-      auto r = _p->ctx->_cancel_io(_p->internal_reference);
-      if(!r)
-      {
-        abort();  // should never happen as promise already satisfied
-      }
-    }
-  }
+  io_awaitable &operator=(const io_awaitable &) = default;
+  ~io_awaitable() = default;
 
-  // Construct an awaitable set later by its promise
-  explicit io_awaitable(promise_type *p)
-      : _p(p)
+  bool await_ready() noexcept
   {
+    // If i/o not started yet, start it
+    if(!this->started())
+    {
+      this->start();
+    }
+    // If i/o already completed, we are ready
+    if(this->completed())
+    {
+      return true;
+    }
+    // Poll i/o for completion, if it completes we are ready
+    if(this->poll() == _base::status_type::completed)
+    {
+      return true;
+    }
+    return false;
   }
-  // Construct an awaitable which has an immediate result
-  LLFIO_TEMPLATE(class T)
-  LLFIO_TREQUIRES(LLFIO_TPRED(std::is_constructible<typename io_multiplexer::template io_result<container_type>, T>::value))
-  io_awaitable(T &&c)
-      : _immediate_result(static_cast<T &&>(c))
+  _result_type await_resume()
   {
+    assert(this->_receiver.result != nullptr);
+    _visitor.await_resume(this);
+    return std::move(this->storage.ret);
   }
-  bool await_ready() noexcept { return _p == nullptr || _p->result_set.load(std::memory_order_acquire); }
-  typename io_multiplexer::template io_result<container_type> await_resume()
-  {
-    if(_p == nullptr)
-    {
-      return static_cast<typename io_multiplexer::template io_result<container_type> &&>(_immediate_result);
-    }
-    assert(_p->result_set.load(std::memory_order_acquire));
-    if(!_p->result_set.load(std::memory_order_acquire))
-    {
-      std::terminate();
-    }
-    // Release my promise as early as possible
-    new(&_immediate_result) typename io_multiplexer::template io_result<container_type>(static_cast<typename io_multiplexer::template io_result<container_type> &&>(_p->result.value));
-    auto r = _p->ctx->_cancel_io(_p->internal_reference);
-    if(!r)
-    {
-      abort();  // should never happen as promise already satisfied
-    }
-    _p = nullptr;
-    return static_cast<typename io_multiplexer::template io_result<container_type> &&>(_immediate_result);
-  }
-  void await_suspend(
 #if LLFIO_ENABLE_COROUTINES
-  coroutine_handle<> /*unused*/
-#endif
-  )
+  void await_suspend(coroutine_handle<> coro)
   {
-    // Pump the i/o context until my promise gets set
-    do
+    _lock_guard g(this->lock);
+    if(this->completed())
     {
-      auto r = _p->ctx->run();
-      if(!r)
-      {
-        auto r2 = _p->ctx->_cancel_io(_p->internal_reference);
-        if(!r2)
-        {
-          abort();
-        }
-        _p = nullptr;
-        new(&_immediate_result) typename io_multiplexer::template io_result<container_type>(r.error());
-      }
-    } while(!await_ready());
+      coro.resume();
+      return;
+    }
+    this->_receiver.coro = coro;
+    _visitor.await_suspend(this);
   }
-};
 #endif
+};
 
 // BEGIN make_free_functions.py
 // END make_free_functions.py

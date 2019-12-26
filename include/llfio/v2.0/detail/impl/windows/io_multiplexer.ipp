@@ -48,10 +48,12 @@ template <bool threadsafe> class win_iocp_impl final : public io_multiplexer_imp
 {
   using _base = io_multiplexer_impl<threadsafe>;
   using _lock_guard = typename _base::_lock_guard;
+  template <class T> using atomic_type = std::conditional_t<threadsafe, std::atomic<T>, detail::fake_atomic<T>>;
 
   static_assert(sizeof(typename detail::io_operation_connection::_OVERLAPPED) == sizeof(OVERLAPPED), "detail::io_operation_connection::_OVERLAPPED does not match OVERLAPPED!");
 
-  std::atomic<size_t> _concurrent_run_instances{0};  // how many threads inside run() there are right now
+  atomic_type<size_t> _concurrent_run_instances{0};  // how many threads inside wait() there are right now
+  atomic_type<size_t> _total_pending_io{0};          // how many pending i/o there are right now
   // Linked list of all deadlined i/o's pending completion
   detail::io_operation_connection *_pending_begin{nullptr}, *_pending_end{nullptr};
 
@@ -72,7 +74,7 @@ public:
   virtual ~win_iocp_impl()
   {
     this->_lock.lock();
-    if(!_durations.empty() || !_absolutes.empty())
+    if(_total_pending_io.load(std::memory_order_acquire) > 0)
     {
       LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with i/o handles still doing work");
       abort();
@@ -106,7 +108,7 @@ public:
     {
       return ntkernel_error(ntstat);
     }
-    // Don't wake wait() for i/o which completes immediately. We ignore
+    // Don't wake run() for i/o which completes immediately. We ignore
     // failure as not all handles support this, and we are idempotent to
     // spurious wakes in any case.
     SetFileCompletionNotificationModes(h->native_handle().h, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE);
@@ -129,7 +131,7 @@ public:
     }
     if(ntstat < 0)
     {
-      abort();
+      return ntkernel_error(ntstat);
     }
     return success();
   }
@@ -226,7 +228,7 @@ public:
   }
 
 
-  virtual result<size_t> wait(deadline d = deadline()) noexcept override final
+  virtual result<int> _do_run(bool nonblocking, deadline d) noexcept override final
   {
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
@@ -238,12 +240,21 @@ public:
       {
         return 1;
       }
+      if(d && d.nsecs == 0 && _total_pending_io.load(std::memory_order_acquire) == 0)
+      {
+        return 0;  // there is nothing to block on
+      }
       _lock_guard g(this->_lock);
 
       // First check if any timeouts have passed, complete those if they have
       bool need_to_wake_all = false;
       LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
       OUTCOME_TRY(resume_timed_out, _do_check_deadlined_io(_timeout, timeout, need_to_wake_all));
+      if(nonblocking)
+      {
+        timeout = &_timeout;
+        _timeout.QuadPart = 0;
+      }
       if(need_to_wake_all)
       {
         // Timeouts ought to be processed by all idle threads concurrently, so wake everything
@@ -273,6 +284,10 @@ public:
       }
       if(STATUS_TIMEOUT == ntstat)
       {
+        if(nonblocking)
+        {
+          return -(int) _total_pending_io.load(std::memory_order_acquire);
+        }
         // If the supplied deadline has passed, return errc::timed_out
         LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
         continue;
@@ -294,22 +309,29 @@ public:
         (void) states;
         // Complete the i/o
         auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
-        op->poll();
+        if(!op->is_cancelled_io)
+        {
+          op->poll();
+        }
+        else
+        {
+          op->is_cancelled_io = false;
+        }
       }
       if(filled - post_wakeups > 0)
       {
-        return filled - post_wakeups;
+        return (int) (filled - post_wakeups);
       }
     }
   }
 
   virtual void _register_pending_io(detail::io_operation_connection *op) noexcept
   {
-    // We only get called for i/o which didn't immediately complete
-    // and which has a deadline
-    // Add this state to the list of pending i/o
-    assert(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point());
+    op->is_registered_with_io_multiplexer = true;
+    _total_pending_io.fetch_add(1, std::memory_order_relaxed);
+    // Add this state to the list of pending i/o if and only if it has a deadline
     bool need_to_wake = false;
+    if(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point())
     {
       _lock_guard g(this->_lock);
       op->next = nullptr;
@@ -323,13 +345,12 @@ public:
         _pending_end->next = op;
       }
       _pending_end = op;
-      op->is_registered_with_io_multiplexer = true;
       if(_concurrent_run_instances.load(std::memory_order_acquire) > 0)
       {
         need_to_wake = true;
       }
     }
-    /* If there are wait() instances running right now, wake any one of them
+    /* If there are run() instances running right now, wake any one of them
     to recalculate timeouts.
     */
     if(need_to_wake)
@@ -339,73 +360,77 @@ public:
   }
   virtual void _deregister_pending_io(detail::io_operation_connection *op) noexcept
   {
-    _lock_guard g(this->_lock);
-    if(op->is_registered_with_io_multiplexer)
+    // If the i/o was cancelled, there may be an IOCP cancellation
+    // packet queued. This needs to be drained before we can tear
+    // down the OVERLAPPED state, otherwise memory corruption will
+    // occur.
+    while(op->is_cancelled_io && poll().value() > 0)
+      ;
+    _total_pending_io.fetch_sub(1, std::memory_order_relaxed);
+    if(op->is_added_to_deadline_list)
     {
-      if(op->is_added_to_deadline_list)
+      _lock_guard g(this->_lock);
+      if(op->deadline_absolute != std::chrono::system_clock::time_point())
       {
-        if(op->deadline_absolute != std::chrono::system_clock::time_point())
+        auto it = _absolutes.find(op->deadline_absolute);
+        if(it == _absolutes.end())
         {
-          auto it = _absolutes.find(op->deadline_absolute);
-          if(it == _absolutes.end())
+          abort();
+        }
+        bool found = false;
+        do
+        {
+          if(it->second == op)
           {
-            abort();
+            _absolutes.erase(it);
+            found = true;
+            break;
           }
-          bool found = false;
-          do
+          ++it;
+        } while(it != _absolutes.end() && it->first == op->deadline_absolute);
+        if(!found)
+        {
+          abort();
+        }
+      }
+      else if(op->deadline_duration != std::chrono::steady_clock::time_point())
+      {
+        auto it = _durations.find(op->deadline_duration);
+        if(it == _durations.end())
+        {
+          abort();
+        }
+        bool found = false;
+        do
+        {
+          if(it->second == op)
           {
-            if(it->second == op)
-            {
-              _absolutes.erase(it);
-              found = true;
-              break;
-            }
-            ++it;
-          } while(it != _absolutes.end() && it->first == op->deadline_absolute);
-          if(!found)
-          {
-            abort();
+            _durations.erase(it);
+            found = true;
+            break;
           }
-        }
-        else if(op->deadline_duration != std::chrono::steady_clock::time_point())
+          ++it;
+        } while(it != _durations.end() && it->first == op->deadline_duration);
+        if(!found)
         {
-          auto it = _durations.find(op->deadline_duration);
-          if(it == _durations.end())
-          {
-            abort();
-          }
-          bool found = false;
-          do
-          {
-            if(it->second == op)
-            {
-              _durations.erase(it);
-              found = true;
-              break;
-            }
-            ++it;
-          } while(it != _durations.end() && it->first == op->deadline_duration);
-          if(!found)
-          {
-            abort();
-          }
+          abort();
         }
-        if(op->prev == nullptr)
-        {
-          _pending_begin = op->next;
-        }
-        else
-        {
-          op->prev->next = op->next;
-        }
-        if(op->next == nullptr)
-        {
-          _pending_end = op->prev;
-        }
-        else
-        {
-          op->next->prev = op->prev;
-        }
+      }
+      if(op->prev == nullptr)
+      {
+        _pending_begin = op->next;
+      }
+      else
+      {
+        op->prev->next = op->next;
+      }
+      if(op->next == nullptr)
+      {
+        _pending_end = op->prev;
+      }
+      else
+      {
+        op->next->prev = op->prev;
       }
     }
   }
