@@ -87,9 +87,6 @@ Distributed under the Boost Software License, Version 1.0.
 
 
 #if defined(_WIN32)
-#if !defined(_UNICODE)
-#error LLFIO cannot target the ANSI Windows API. Please define _UNICODE to target the Unicode Windows API.
-#endif
 #if !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0600
 #elif _WIN32_WINNT < 0x0600

@@ -48,7 +48,7 @@ namespace path_discovery
       for(auto &variable : variables)
       {
         buffer.resize(32768);
-        DWORD len = GetEnvironmentVariable(variable, const_cast<LPWSTR>(buffer.data()), static_cast<DWORD>(buffer.size()));
+        DWORD len = GetEnvironmentVariableW(variable, const_cast<LPWSTR>(buffer.data()), static_cast<DWORD>(buffer.size()));
         if((len != 0u) && len < buffer.size())
         {
           buffer.resize(len);
@@ -102,7 +102,7 @@ namespace path_discovery
     // fall back to Win3.1 era "the Windows directory" which definitely won't be
     // C:\Windows nowadays
     buffer.resize(32768);
-    DWORD len = GetWindowsDirectory(const_cast<LPWSTR>(buffer.data()), static_cast<UINT>(buffer.size()));
+    DWORD len = GetWindowsDirectoryW(const_cast<LPWSTR>(buffer.data()), static_cast<UINT>(buffer.size()));
     if((len != 0u) && len < buffer.size())
     {
       buffer.resize(len);
@@ -111,7 +111,7 @@ namespace path_discovery
     }
     // And if even that fails, try good old %SYSTEMDRIVE%\Temp
     buffer.resize(32768);
-    len = GetSystemWindowsDirectory(const_cast<LPWSTR>(buffer.data()), static_cast<UINT>(buffer.size()));
+    len = GetSystemWindowsDirectoryW(const_cast<LPWSTR>(buffer.data()), static_cast<UINT>(buffer.size()));
     if((len != 0u) && len < buffer.size())
     {
       buffer.resize(len);

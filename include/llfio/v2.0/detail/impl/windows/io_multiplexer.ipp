@@ -349,7 +349,6 @@ public:
       LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
 
       // Figure out how long we can sleep the thread for
-      LARGE_INTEGER _timeout{}, *timeout = nullptr;
       LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
       bool need_to_wake_all = false;
       detail::io_operation_connection *in[64];

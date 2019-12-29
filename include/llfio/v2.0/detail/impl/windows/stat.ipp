@@ -120,7 +120,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<size_t> stat_t::fill(const handle &h, sta
   {
     // This is a bit hacky, but we just need a unique device number
     alignas(8) wchar_t buffer_[32769];
-    DWORD len = GetFinalPathNameByHandle(h.native_handle().h, buffer_, sizeof(buffer_) / sizeof(*buffer_), VOLUME_NAME_NT);
+    DWORD len = GetFinalPathNameByHandleW(h.native_handle().h, buffer_, sizeof(buffer_) / sizeof(*buffer_), VOLUME_NAME_NT);
     if((len == 0u) || len >= sizeof(buffer_) / sizeof(*buffer_))
     {
       return win32_error();

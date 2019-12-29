@@ -79,7 +79,7 @@ namespace utils
           TOKEN_PRIVILEGES privs{};
           memset(&privs, 0, sizeof(privs));
           privs.PrivilegeCount = 1;
-          if(LookupPrivilegeValue(nullptr, SE_LOCK_MEMORY_NAME, &privs.Privileges[0].Luid))
+          if(LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &privs.Privileges[0].Luid))
           {
             privs.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             if((AdjustTokenPrivileges(token, FALSE, &privs, 0, nullptr, nullptr) != 0) && GetLastError() == S_OK)
@@ -122,7 +122,7 @@ namespace utils
       auto unprocessToken = undoer([&processToken] { CloseHandle(processToken); });
       {
         LUID luid{};
-        if(!LookupPrivilegeValue(nullptr, L"SeProfileSingleProcessPrivilege", &luid))
+        if(!LookupPrivilegeValueW(nullptr, L"SeProfileSingleProcessPrivilege", &luid))
         {
           return win32_error();
         }
@@ -168,7 +168,7 @@ namespace utils
       auto unprocessToken = undoer([&processToken] { CloseHandle(processToken); });
       {
         LUID luid{};
-        if(!LookupPrivilegeValue(nullptr, L"SeIncreaseQuotaPrivilege", &luid))
+        if(!LookupPrivilegeValueW(nullptr, L"SeIncreaseQuotaPrivilege", &luid))
         {
           return win32_error();
         }

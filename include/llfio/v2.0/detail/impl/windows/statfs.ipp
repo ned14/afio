@@ -147,7 +147,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<size_t> statfs_t::fill(const handle &h, s
     alignas(8) wchar_t buffer2[32769];
     for(;;)
     {
-      DWORD pathlen = GetFinalPathNameByHandle(h.native_handle().h, buffer2, sizeof(buffer2) / sizeof(*buffer2), FILE_NAME_OPENED | VOLUME_NAME_NONE);
+      DWORD pathlen = GetFinalPathNameByHandleW(h.native_handle().h, buffer2, sizeof(buffer2) / sizeof(*buffer2), FILE_NAME_OPENED | VOLUME_NAME_NONE);
       if((pathlen == 0u) || pathlen >= sizeof(buffer2) / sizeof(*buffer2))
       {
         return win32_error();
@@ -155,7 +155,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<size_t> statfs_t::fill(const handle &h, s
       buffer2[pathlen] = 0;
       if(wanted & want::mntfromname)
       {
-        DWORD len = GetFinalPathNameByHandle(h.native_handle().h, buffer, sizeof(buffer) / sizeof(*buffer), FILE_NAME_OPENED | VOLUME_NAME_NT);
+        DWORD len = GetFinalPathNameByHandleW(h.native_handle().h, buffer, sizeof(buffer) / sizeof(*buffer), FILE_NAME_OPENED | VOLUME_NAME_NT);
         if((len == 0u) || len >= sizeof(buffer) / sizeof(*buffer))
         {
           return win32_error();
@@ -182,7 +182,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<size_t> statfs_t::fill(const handle &h, s
       }
       if(wanted & want::mntonname)
       {
-        DWORD len = GetFinalPathNameByHandle(h.native_handle().h, buffer, sizeof(buffer) / sizeof(*buffer), FILE_NAME_OPENED | VOLUME_NAME_DOS);
+        DWORD len = GetFinalPathNameByHandleW(h.native_handle().h, buffer, sizeof(buffer) / sizeof(*buffer), FILE_NAME_OPENED | VOLUME_NAME_DOS);
         if((len == 0u) || len >= sizeof(buffer) / sizeof(*buffer))
         {
           return win32_error();

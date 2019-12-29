@@ -130,7 +130,7 @@ result<section_handle> section_handle::section(file_handle &backing, extent_type
     DWORD sessionid = 0;
     if(ProcessIdToSessionId(GetCurrentProcessId(), &sessionid) != 0)
     {
-      wsprintf(buffer_, L"\\Sessions\\%u\\BaseNamedObjects\\", sessionid);
+      wsprintfW(buffer_, L"\\Sessions\\%u\\BaseNamedObjects\\", sessionid);
     }
     return buffer_;
   }();

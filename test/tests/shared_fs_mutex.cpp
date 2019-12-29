@@ -148,14 +148,8 @@ struct child_workers
 
   template <class... Args> child_workers(std::string name, size_t workersno, Args &&... _args)
   {
-#ifdef _UNICODE
-    std::wstringstream ss1, ss2, ss3;
-    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> utf16conv;
-    auto convstr = [&](const std::string &v) { return utf16conv.from_bytes(v); };
-#else
-    std::stringstream ss1, ss2, ss3;
-    auto convstr = [](const std::string &v) { return v; };
-#endif
+    std::basic_stringstream<filesystem::path::value_type> ss1, ss2, ss3;
+    auto convstr = [](const std::string &v) { return filesystem::path(v).native(); };
     ss1 << "--kerneltestchild," << convstr(name) << ",";
     ss3 << ",";
     detail::print_args(ss3, std::forward<Args>(_args)...);

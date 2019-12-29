@@ -51,7 +51,7 @@ result<handle::path_type> handle::current_path() const noexcept
     buffer.resize(32769);
     auto *_buffer = const_cast<wchar_t *>(buffer.data());
     memcpy(_buffer, L"\\!!", 6);
-    DWORD len = GetFinalPathNameByHandle(_v.h, _buffer + 3, (DWORD)(buffer.size() - 4 * sizeof(wchar_t)), VOLUME_NAME_NT);  // NOLINT
+    DWORD len = GetFinalPathNameByHandleW(_v.h, _buffer + 3, (DWORD)(buffer.size() - 4 * sizeof(wchar_t)), VOLUME_NAME_NT);  // NOLINT
     if(len == 0)
     {
       return win32_error();

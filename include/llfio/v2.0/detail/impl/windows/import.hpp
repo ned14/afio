@@ -245,9 +245,9 @@ namespace windows_nt_kernel
     DWORD SizeOfStruct;
     PVOID Key;
     DWORD LineNumber;
-    PTSTR FileName;
+    PWSTR FileName;
     DWORD64 Address;
-  } IMAGEHLP_LINE64, *PIMAGEHLP_LINE64;
+  } IMAGEHLP_LINEW64, *PIMAGEHLP_LINEW64;
 
   typedef enum _SECTION_INHERIT
   {
@@ -371,7 +371,7 @@ namespace windows_nt_kernel
 
   using OpenProcessToken_t = BOOL(NTAPI *)(_In_ HANDLE ProcessHandle, _In_ DWORD DesiredAccess, _Out_ PHANDLE TokenHandle);
 
-  using LookupPrivilegeValue_t = BOOL(NTAPI *)(_In_opt_ LPCTSTR lpSystemName, _In_ LPCTSTR lpName, _Out_ PLUID lpLuid);
+  using LookupPrivilegeValue_t = BOOL(NTAPI *)(_In_opt_ LPCWSTR lpSystemName, _In_ LPCWSTR lpName, _Out_ PLUID lpLuid);
 
   using AdjustTokenPrivileges_t = BOOL(NTAPI *)(_In_ HANDLE TokenHandle, _In_ BOOL DisableAllPrivileges, _In_opt_ PTOKEN_PRIVILEGES NewState, _In_ DWORD BufferLength, _Out_opt_ PTOKEN_PRIVILEGES PreviousState, _Out_opt_ PDWORD ReturnLength);
 
@@ -381,9 +381,9 @@ namespace windows_nt_kernel
 
   using RtlCaptureStackBackTrace_t = USHORT(NTAPI *)(_In_ ULONG FramesToSkip, _In_ ULONG FramesToCapture, _Out_ PVOID *BackTrace, _Out_opt_ PULONG BackTraceHash);
 
-  using SymInitialize_t = BOOL(NTAPI *)(_In_ HANDLE hProcess, _In_opt_ PCTSTR UserSearchPath, _In_ BOOL fInvadeProcess);
+  using SymInitialize_t = BOOL(NTAPI *)(_In_ HANDLE hProcess, _In_opt_ PCWSTR UserSearchPath, _In_ BOOL fInvadeProcess);
 
-  using SymGetLineFromAddr64_t = BOOL(NTAPI *)(_In_ HANDLE hProcess, _In_ DWORD64 dwAddr, _Out_ PDWORD pdwDisplacement, _Out_ PIMAGEHLP_LINE64 Line);
+  using SymGetLineFromAddr64_t = BOOL(NTAPI *)(_In_ HANDLE hProcess, _In_ DWORD64 dwAddr, _Out_ PDWORD pdwDisplacement, _Out_ PIMAGEHLP_LINEW64 Line);
 
   using RtlDosPathNameToNtPathName_U_t = BOOLEAN(NTAPI *)(__in PCWSTR DosFileName, __out PUNICODE_STRING NtFileName, __out_opt PWSTR *FilePart, __out_opt PVOID RelativeName);
 
@@ -1640,7 +1640,7 @@ not replace the inode if it already exists. We map it correctly to FILE_SUPERSED
 This edition does pretty much the same as the Win32 edition, minus support for file
 templates and lpFileName being anything but a file path.
 */
-inline HANDLE CreateFileW_(_In_ LPCTSTR lpFileName, _In_ DWORD dwDesiredAccess, _In_ DWORD dwShareMode, _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes, _In_ DWORD dwCreationDisposition, _In_ DWORD dwFlagsAndAttributes, _In_opt_ HANDLE hTemplateFile, bool forcedir = false)
+inline HANDLE CreateFileW_(_In_ LPCWSTR lpFileName, _In_ DWORD dwDesiredAccess, _In_ DWORD dwShareMode, _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes, _In_ DWORD dwCreationDisposition, _In_ DWORD dwFlagsAndAttributes, _In_opt_ HANDLE hTemplateFile, bool forcedir = false)
 {
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
