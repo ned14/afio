@@ -164,10 +164,10 @@ static inline void TestMultiplexedPipeHandle()
   // Wait for all reads to complete
   for(size_t n = 0; n < MAX_PIPES; n++)
   {
-    // Block until this i/o completes
+    // Spin until this i/o completes
     while(async_reads[n].poll() == llfio::io_state_status::scheduled)
     {
-      llfio::this_thread::multiplexer()->run().value();
+      llfio::this_thread::multiplexer()->complete_io().value();
     }
   }
   for(size_t n = 0; n < MAX_PIPES; n++)
@@ -263,7 +263,7 @@ static inline void TestCoroutinedPipeHandle()
       if(need_to_poll)
       {
         // Have the kernel tell me when an i/o completion is ready
-        auto r = multiplexer->poll();
+        auto r = multiplexer->complete_io();
         BOOST_CHECK(r.value() != 0);
         if(r.value() < 0)
         {

@@ -1254,22 +1254,7 @@ inline HANDLE get_thread_local_waitable_timer()
       _timeout.QuadPart = ns.count() / -100;                                                                                                                                                                                                                                                                                   \
   }
 
-#define LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d)                                                                                                                                                                                                                                                                                  \
-                                                                                                                                                                                                                                                                                                                               \
-  if(d)                                                                                                                                                                                                                                                                                                                        \
-                                                                                                                                                                                                                                                                                                                               \
-  {                                                                                                                                                                                                                                                                                                                            \
-    if((d).steady)                                                                                                                                                                                                                                                                                                             \
-    {                                                                                                                                                                                                                                                                                                                          \
-      if(std::chrono::steady_clock::now() >= (began_steady + std::chrono::nanoseconds((d).nsecs)))                                                                                                                                                                                                                             \
-        return errc::timed_out;                                                                                                                                                                                                                                                                                                \
-    }                                                                                                                                                                                                                                                                                                                          \
-    else                                                                                                                                                                                                                                                                                                                       \
-    {                                                                                                                                                                                                                                                                                                                          \
-      if(std::chrono::system_clock::now() >= end_utc)                                                                                                                                                                                                                                                                          \
-        return errc::timed_out;                                                                                                                                                                                                                                                                                                \
-    }                                                                                                                                                                                                                                                                                                                          \
-  }
+#define LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d) LLFIO_DEADLINE_TO_TIMEOUT_LOOP(d)
 #endif
 
 // Initialise an IO_STATUS_BLOCK for later wait operations
@@ -1328,7 +1313,7 @@ inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const 
     {
       // If he'll still pending, we must cancel the i/o
       ntstat = ntcancel_pending_io(h, isb);
-      if(ntstat<0 && ntstat != 0xC0000120 /*STATUS_CANCELLED*/)
+      if(ntstat < 0 && ntstat != 0xC0000120 /*STATUS_CANCELLED*/)
       {
         LLFIO_LOG_FATAL(nullptr, "Failed to cancel earlier i/o");
         abort();

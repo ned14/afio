@@ -439,49 +439,86 @@ public:
   //! The native handle used by this i/o context
   native_handle_type native_handle() const noexcept { return _v; }
 
-  /*! \brief Checks if any items have been posted, and if so executes one, returning true.
-  If no items have been posted, returns false.
+  /*! \brief Invokes any posted items, until all items posted at the time of call
+  have been executed, or either the count or deadline limit is reached. Returns
+  the number of posted items invoked. Does not block if there are no posted items.
 
-  \mallocs May perform a dynamic memory free, and a single mutex lock-unlock cycle.
+  Note that unlike most other deadline taking APIs in LLFIO, this one never
+  returns `errc::timed_out`, it simply exits sooner than it would have done
+  otherwise.
+
+  \mallocs May perform a dynamic memory free, and a single mutex lock-unlock cycle
+  per posted item invoked. Clock retrieving syscalls are performed if the deadline
+  is non zero or non infinite.
   */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC bool check_posted_items() noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> invoke_posted_items(int max_items = -1, deadline d = deadline()) noexcept = 0;
 
-  /*! \brief Checks if any currently pending i/o has passed its deadline, and if so
-  completes the most expired i/o now, returning true. If no pending i/o has passed
-  its deadline, returns false.
+  /*! \brief Updates the internal ordered list of pending i/o according to interval
+  to deadline expiry, and for all pending i/o later than their deadline, cancels
+  the i/o and invokes completion with `errc::timed_out`, returning the number of
+  pending i/o completed. If no pending i/o has passed its deadline, returns a
+  negative number. If there is no pending i/o with deadlines, returns zero.
+
+  Only the expired i/o calculated at the beginning is completed -- therefore this
+  routine will not enter an infinite loop if completions take a long time.
+
+  For efficiency, this call may complete fewer than the total pending i/o
+  which has timed out at the time of the call.
+
+  Note that unlike most other deadline taking APIs in LLFIO, this one never
+  returns `errc::timed_out`, it simply exits sooner than it would have done
+  otherwise.
 
   \mallocs May perform a dynamic memory allocation per previously unseen pending i/o
   in order to calculate an ordered list of pending i/o. A single mutex lock-unlock
-  cycle may occur.
+  cycle may occur per completed i/o. Clock retrieving syscalls are performed to
+  fetch the current time.
   */
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<bool> check_deadlined_io() noexcept = 0;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> timeout_io(int max_items = -1, deadline d = deadline()) noexcept = 0;
 
-private:
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> _do_run(bool nonblocking, deadline d) noexcept = 0;
+  /*! \brief Efficiently check all pending i/o for i/o completion, which may
+  or may not include time out, and invoke completion appropriately, returning
+  the number of pending i/o completed. If no pending i/o has been completed,
+  returns a negative number. If there is no pending i/o at all, returns zero.
 
-public:
+  For efficiency, this call may complete fewer than the total pending i/o
+  which has completed at the time of the call.
+
+  Note that unlike most other deadline taking APIs in LLFIO, this one never
+  returns `errc::timed_out`, it simply exits sooner than it would have done
+  otherwise.
+
+  \mallocs May call a syscall per previously unseen pending i/o. Will call
+  a syscall to ask the kernel for which pending i/o have completed. A single
+  mutex lock-unlock cycle may occur per completed i/o. Clock retrieving
+  syscalls are performed if the deadline is non zero or non infinite.
+  */
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> complete_io(int max_items = -1, deadline d = deadline()) noexcept = 0;
+
   /*! \brief Block up to the deadline specified waiting for posted items, i/o
-  to complete, or i/o to time out.
+  to complete, or i/o to time out. Returns the number of items of work done.
 
-  Calls `check_posted_items()` and `check_deadlined_io()`, returning `1`
-  if either returned true. If there are no posted items and no pending i/o and
-  there is a zero deadline, returns zero. Otherwise, waits for the first pending
-  i/o to signal. For all i/o reported by the operating system to have completed,
-  invokes the completion of their Receivers. Returns the number of i/o completed;
-  `errc::timed_out` if the deadline passed.
+  This is partially a combination of `.invoke_posted_items()`, `.timeout_io()`
+  and `.complete_io()`, however unlike those calls where the deadline
+  specifies when to early exit, this call will sleep the calling thread
+  until new events occur.
+
+  Immediately returns zero if there is no work which could be done (no
+  pending items, no pending i/o), as some implementations cannot sleep
+  a thread when there is no pending i/o. You can always detect when i/o
+  became pending from the i/o state's `.poll()` return value.
+
+  This is a fairly expensive call. However if you are willing to sleep
+  the thread, expense is probably not so important. High performance code
+  probably ought to spin loop all three of the functions above for some
+  period of time until entering power efficient sleep using this function.
+  This function will wake the thread whenever something new happens.
 
   \mallocs Many dynamic memory allocations and syscalls and mutex lock-unlock cycles
-  may be performed. This is a non-deterministic function.
+  may be performed. This is a highly non-deterministic function.
   */
-  result<int> run(deadline d = deadline()) noexcept { return _do_run(false, d);
-  }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC result<int> run(int max_items = -1, deadline d = deadline()) noexcept = 0;
   LLFIO_DEADLINE_TRY_FOR_UNTIL(run)
-
-  /*! \overload Convenience non-blocking overload for `run()`. Returns a negative
-  number if no completions nor posts currently available; a non-zero positive number
-  if a posted item was executed or completion processed; zero if no pending i/o remains.
-  */
-  result<int> poll() noexcept { return _do_run(true, {}); }
 
 protected:
   constexpr io_multiplexer() {}
@@ -509,6 +546,9 @@ public:
       {
         U f;
         function_ptr<void(void *)> next;
+        // If called with nullptr, execute and return next
+        // If called with object and is unset, set object
+        // If called with object and is set, return previously set object
         void *operator()(void *n)
         {
           if(n != nullptr)
@@ -1036,15 +1076,16 @@ public:
     return *this;
   }
   //! If the i/o is started and not completed, will call `.cancel()`, which may block.
-  ~io_operation_connection() {
+  ~io_operation_connection()
+  {
     if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
     {
       _lock_guard g(this->lock);
       if(this->status.load(std::memory_order_acquire) == _status_type::scheduled)
       {
         this->_cancel_io();
-        //sender_type::_create_result(errc::operation_canceled);
-        sender_type::_create_result((size_t)-1);  // suppress all the error log messages
+        // sender_type::_create_result(errc::operation_canceled);
+        sender_type::_create_result((size_t) -1);  // suppress all the error log messages
         // Set cancelled. We cannot set value, for a coroutine receiver
         // that would resume the coroutine, and this destructor may be being
         // called because the coroutine frame is being destroyed. Reentering
@@ -1120,7 +1161,7 @@ public:
         this->_cancel_io();
         sender_type::_create_result(errc::operation_canceled);
         // Set cancelled
-        _receiver.set_value(std::move(this->storage.ret));
+        _receiver.set_done();
       }
     }
   }
@@ -1180,8 +1221,8 @@ public:
 
 //! \brief Connect an `async_read` Sender with a Receiver
 LLFIO_TEMPLATE(bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(  //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::buffers_type>>())), //
+LLFIO_TREQUIRES(                                                                                                                                      //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_read_sender<use_atomic> &&sender, Receiver &&receiver)
 {
@@ -1190,8 +1231,8 @@ auto connect(async_read_sender<use_atomic> &&sender, Receiver &&receiver)
 
 //! \brief Connect an `async_write` Sender with a Receiver
 LLFIO_TEMPLATE(bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(  //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())), //
+LLFIO_TREQUIRES(                                                                                                                                            //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_write_sender<use_atomic> &&sender, Receiver &&receiver)
 {
@@ -1200,8 +1241,8 @@ auto connect(async_write_sender<use_atomic> &&sender, Receiver &&receiver)
 
 //! \brief Connect an `async_barrier` Sender with a Receiver
 LLFIO_TEMPLATE(bool use_atomic, class Receiver)
-LLFIO_TREQUIRES(  //
-LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())), //
+LLFIO_TREQUIRES(                                                                                                                                            //
+LLFIO_TEXPR(std::declval<Receiver>().set_value(std::declval<typename io_multiplexer::template io_result<typename io_multiplexer::const_buffers_type>>())),  //
 LLFIO_TEXPR(std::declval<Receiver>().set_done()))
 auto connect(async_barrier_sender<use_atomic> &&sender, Receiver &&receiver)
 {

@@ -57,7 +57,7 @@ template <bool threadsafe> class win_iocp_impl final : public io_multiplexer_imp
   // Linked list of all deadlined i/o's pending completion
   detail::io_operation_connection *_pending_begin{nullptr}, *_pending_end{nullptr};
 
-  // ONLY if _do_check_deadlined_io() is called
+  // ONLY if _do_timeout_io() is called
   std::multimap<std::chrono::steady_clock::time_point, detail::io_operation_connection *> _durations;
   std::multimap<std::chrono::system_clock::time_point, detail::io_operation_connection *> _absolutes;
 
@@ -136,21 +136,17 @@ public:
     return success();
   }
 
-  virtual bool check_posted_items() noexcept override final
+  virtual result<int> invoke_posted_items(int max_items = -1, deadline d = deadline()) noexcept override final
   {
     LLFIO_LOG_FUNCTION_CALL(this);
-    if(this->_execute_posted_items())
-    {
-      return true;
-    }
-    return false;
+    return this->_execute_posted_items(max_items, d);
   }
 
-  virtual result<detail::io_operation_connection *> _do_check_deadlined_io(LARGE_INTEGER &_timeout, LARGE_INTEGER *&timeout, bool &need_to_wake_all) noexcept
+  result<span<detail::io_operation_connection *>> _do_timeout_io(LARGE_INTEGER &_timeout, LARGE_INTEGER *&timeout, bool &need_to_wake_all, span<detail::io_operation_connection *> in) noexcept
   {
     try
     {
-      detail::io_operation_connection *resume_timed_out = nullptr;
+      span<detail::io_operation_connection *> out(in.data(), (size_t) 0);
       for(auto *i = _pending_end; i != nullptr && !i->is_added_to_deadline_list; i = i->prev)
       {
         if(i->deadline_absolute != std::chrono::system_clock::time_point())
@@ -173,37 +169,52 @@ public:
       }
 
       // Process timed out pending operations, shortening the requested timeout if necessary
-      std::chrono::steady_clock::time_point deadline_duration;
-      std::chrono::system_clock::time_point deadline_absolute;
-      if(!_durations.empty())
+      const auto durations_now = _durations.empty() ? std::chrono::steady_clock::time_point() : std::chrono::steady_clock::now();
+      const auto absolutes_now = _absolutes.empty() ? std::chrono::system_clock::time_point() : std::chrono::system_clock::now();
+      auto durationit = _durations.begin();
+      auto absoluteit = _absolutes.begin();
+      while(out.size() < in.size())
       {
-        deadline_duration = _durations.begin()->first;
-        auto togo = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline_duration - std::chrono::steady_clock::now()).count();
-        if(togo <= 0)
+        int64_t togo1 = (durationit != _durations.end()) ? std::chrono::duration_cast<std::chrono::nanoseconds>(durationit->first - durations_now).count() : INT64_MAX;
+        int64_t togo2 = (absoluteit != _absolutes.end()) ? std::chrono::duration_cast<std::chrono::nanoseconds>(absoluteit->first - absolutes_now).count() : INT64_MAX;
+        if(togo1 > 0)
         {
-          resume_timed_out = _durations.begin()->second;
+          if(nullptr == timeout || togo1 / -100 > timeout->QuadPart)
+          {
+            timeout = &_timeout;
+            timeout->QuadPart = togo1 / -100;
+          }
+          durationit = _durations.end();
+          togo1 = INT64_MAX;
         }
-        else if(nullptr == timeout || togo / -100 > timeout->QuadPart)
+        if(togo2 > 0)
         {
-          timeout = &_timeout;
-          timeout->QuadPart = togo / -100;
+          if(nullptr == timeout || togo2 < -timeout->QuadPart)
+          {
+            timeout = &_timeout;
+            *timeout = windows_nt_kernel::from_timepoint(absoluteit->first);
+          }
+          absoluteit = _absolutes.end();
+          togo2 = INT64_MAX;
+        }
+        if(durationit != _durations.end() || absoluteit != _absolutes.end())
+        {
+          // Choose whichever is the earliest
+          if(togo1 < togo2)
+          {
+            out = {out.data(), out.size() + 1};
+            out[out.size() - 1] = durationit->second;
+            ++durationit;
+          }
+          else
+          {
+            out = {out.data(), out.size() + 1};
+            out[out.size() - 1] = absoluteit->second;
+            ++absoluteit;
+          }
         }
       }
-      if(!_absolutes.empty())
-      {
-        deadline_absolute = _absolutes.begin()->first;
-        auto togo = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline_absolute - std::chrono::system_clock::now()).count();
-        if(togo <= 0)
-        {
-          resume_timed_out = _absolutes.begin()->second;
-        }
-        else if(nullptr == timeout || togo < -timeout->QuadPart)
-        {
-          timeout = &_timeout;
-          *timeout = windows_nt_kernel::from_timepoint(deadline_absolute);
-        }
-      }
-      return resume_timed_out;
+      return out;
     }
     catch(...)
     {
@@ -211,23 +222,188 @@ public:
     }
   }
 
-  virtual result<bool> check_deadlined_io() noexcept override final
+  virtual result<int> timeout_io(int max_items = -1, deadline d = deadline()) noexcept override final
   {
     LLFIO_LOG_FUNCTION_CALL(this);
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
+    }
     _lock_guard g(this->_lock);
     LARGE_INTEGER _timeout{}, *timeout = nullptr;
     bool need_to_wake_all = false;
-    OUTCOME_TRY(resume_timed_out, _do_check_deadlined_io(_timeout, timeout, need_to_wake_all));
-    if(resume_timed_out != nullptr)
+    detail::io_operation_connection *in[64];
+    OUTCOME_TRY(out, _do_timeout_io(_timeout, timeout, need_to_wake_all, {(detail::io_operation_connection **) in, (size_t) std::min(64, max_items)}));
+    if(out.empty())
     {
-      g.unlock();
-      resume_timed_out->poll();
-      return true;
+      auto total = _durations.size() + _absolutes.size();
+      return -(int) total;
     }
-    return false;
+    g.unlock();
+    LLFIO_DEADLINE_TO_SLEEP_INIT(d);
+    int count = 0;
+    for(auto *i : out)
+    {
+      i->poll();
+      ++count;
+      if(max_items == count)
+      {
+        break;
+      }
+      if(d)
+      {
+        if((d.steady && (d.nsecs == 0 || std::chrono::steady_clock::now() >= began_steady)) || (!d.steady && std::chrono::system_clock::now() >= end_utc))
+        {
+          break;
+        }
+      }
+    }
+    return count;
   }
 
+  result<int> _do_complete_io(LARGE_INTEGER *timeout, int max_items) noexcept
+  {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
+    if(_total_pending_io.load(std::memory_order_acquire) == 0)
+    {
+      return 0;
+    }
 
+    OVERLAPPED_ENTRY entries[64];
+    ULONG filled = 0;
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
+    }
+    if(max_items > sizeof(entries) / sizeof(entries[0]))
+    {
+      max_items = (int) (sizeof(entries) / sizeof(entries[0]));
+    }
+    NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, (unsigned) max_items, &filled, timeout, false);
+    if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
+    {
+      return ntkernel_error(ntstat);
+    }
+    if(filled == 0 || ntstat == STATUS_TIMEOUT)
+    {
+      return -(int) _total_pending_io.load(std::memory_order_acquire);
+    }
+    int count = 0;
+    for(ULONG n = 0; n < filled; n++)
+    {
+      // If it's null, this is a post() wakeup
+      if(entries[n].lpCompletionKey == 0)
+      {
+        continue;
+      }
+      auto *states = (std::vector<detail::io_operation_connection *> *) entries[n].lpCompletionKey;
+      (void) states;
+      // Complete the i/o
+      auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
+      if(!op->is_cancelled_io)
+      {
+        op->poll();
+        ++count;
+      }
+      else
+      {
+        op->is_cancelled_io = false;
+      }
+    }
+    if(count == 0)
+    {
+      return -(int) _total_pending_io.load(std::memory_order_acquire);
+    }
+    return count;
+  }
+
+  virtual result<int> complete_io(int max_items = -1, deadline /*unused*/ = deadline()) noexcept override final
+  {
+    LLFIO_LOG_FUNCTION_CALL(this);
+    LARGE_INTEGER timeout;
+    memset(&timeout, 0, sizeof(timeout));  // poll don't block
+    return _do_complete_io(&timeout, max_items);
+  }
+
+  result<int> run(int max_items = -1, deadline d = deadline()) noexcept override final
+  {
+    LLFIO_LOG_FUNCTION_CALL(this);
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
+    }
+    int count = 0;
+    LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
+    for(;;)
+    {
+      count += this->_execute_posted_items(max_items, d);
+      if(max_items == count)
+      {
+        return count;
+      }
+      if(count==0 && _total_pending_io.load(std::memory_order_acquire) == 0)
+      {
+        return 0;  // there is nothing to block on
+      }
+      LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
+
+      // Figure out how long we can sleep the thread for
+      LARGE_INTEGER _timeout{}, *timeout = nullptr;
+      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
+      bool need_to_wake_all = false;
+      detail::io_operation_connection *in[64];
+      _lock_guard g(this->_lock);
+      // Indicate to any concurrent run() that we are about to calculate timeouts,
+      // this will decrement on exit
+      _concurrent_run_instances.fetch_add(1, std::memory_order_acq_rel);
+      auto un_concurrent_run_instances = undoer([this] { _concurrent_run_instances.fetch_sub(1, std::memory_order_acq_rel); });
+      OUTCOME_TRY(out, _do_timeout_io(_timeout, timeout, need_to_wake_all, {(detail::io_operation_connection **) in, (size_t) std::min(64, max_items - count)}));
+      if(need_to_wake_all)
+      {
+        // Timeouts ought to be processed by all idle threads concurrently, so wake everything
+        auto threads_sleeping = _concurrent_run_instances.load(std::memory_order_acquire);
+        for(size_t n = 0; n < threads_sleeping; n++)
+        {
+          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
+        }
+      }
+      g.unlock();
+      if(!out.empty())
+      {
+        for(auto *i : out)
+        {
+          i->poll();
+          ++count;
+          if(max_items == count)
+          {
+            return count;
+          }
+          LLFIO_DEADLINE_TO_TIMEOUT_LOOP(d);
+        }
+        // No need to adjust timeout after executing completions as
+        // we zero the timeout below anyway
+      }
+
+      // timeout will be the lesser of the next pending i/o to expire,
+      // or the deadline passed into us. If we've done any work at all,
+      // only poll for i/o completions so we return immediately after.
+      if(count > 0)
+      {
+        timeout->QuadPart = 0;
+      }
+      OUTCOME_TRY(items, _do_complete_io(timeout, max_items - count));
+      count += items;
+      if(count > 0)
+      {
+        return count;
+      }
+      // Loop if no work done, as either there are new posted items or
+      // we have timed out
+    }
+  }
+
+#if 0
   virtual result<int> _do_run(bool nonblocking, deadline d) noexcept override final
   {
     windows_nt_kernel::init();
@@ -249,7 +425,7 @@ public:
       // First check if any timeouts have passed, complete those if they have
       bool need_to_wake_all = false;
       LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
-      OUTCOME_TRY(resume_timed_out, _do_check_deadlined_io(_timeout, timeout, need_to_wake_all));
+      OUTCOME_TRY(resume_timed_out, _do_timeout_io(_timeout, timeout, need_to_wake_all));
       if(nonblocking)
       {
         timeout = &_timeout;
@@ -324,7 +500,7 @@ public:
       }
     }
   }
-
+#endif
   virtual void _register_pending_io(detail::io_operation_connection *op) noexcept
   {
     op->is_registered_with_io_multiplexer = true;
@@ -364,7 +540,7 @@ public:
     // packet queued. This needs to be drained before we can tear
     // down the OVERLAPPED state, otherwise memory corruption will
     // occur.
-    while(op->is_cancelled_io && poll().value() > 0)
+    while(op->is_cancelled_io && complete_io().value() > 0)
       ;
     _total_pending_io.fetch_sub(1, std::memory_order_relaxed);
     if(op->is_added_to_deadline_list)

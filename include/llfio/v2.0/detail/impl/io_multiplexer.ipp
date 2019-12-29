@@ -58,26 +58,60 @@ protected:
   std::atomic<bool> _nonzero_items_posted{false};
   function_ptr<void *(void *)> _items_posted, *_last_item_posted{nullptr};
 
-  bool _execute_posted_items()
+  int _execute_posted_items(int max_items, deadline d)
   {
     if(_nonzero_items_posted.load(std::memory_order_acquire))
     {
-      function_ptr<void *(void *)> i, empty;
+      LLFIO_DEADLINE_TO_SLEEP_INIT(d);
+      if(max_items < 0)
+      {
+        max_items = INT_MAX;
+      }
+      function_ptr<void *(void *)> i, remaining, empty, *remaining_last_item_posted;
       {
         std::lock_guard<std::mutex> h(_lock);  // need real locking here
-        i = std::move(_items_posted);          // Detach item from front
-        _items_posted = std::move(*reinterpret_cast<function_ptr<void *(void *)> *>(i(&empty)));
-        if(!_items_posted)
-        {
-          _last_item_posted = nullptr;
-          _nonzero_items_posted.store(false, std::memory_order_release);
-        }
+        remaining = std::move(_items_posted);
+        remaining_last_item_posted = _last_item_posted;
+        _last_item_posted = nullptr;
+        _nonzero_items_posted.store(false, std::memory_order_release);
       }
-      // Execute the item
-      i(nullptr);
-      return true;
+      int count = 0;
+      do
+      {
+        // Execute the item
+        i = std::move(remaining);
+        remaining = std::move(*reinterpret_cast<function_ptr<void *(void *)> *>(i(&empty)));
+        i(nullptr);
+        ++count;
+        if(!remaining)
+        {
+          break;
+        }
+        if(d)
+        {
+          if((d.steady && (d.nsecs == 0 || std::chrono::steady_clock::now() >= began_steady)) || (!d.steady && std::chrono::system_clock::now() >= end_utc))
+          {
+            // Reinsert remaining into list
+            std::lock_guard<std::mutex> h(_lock);  // need real locking here
+            if(_last_item_posted == nullptr)
+            {
+              _items_posted = std::move(remaining);
+              _last_item_posted = remaining_last_item_posted;
+            }
+            else
+            {
+              // Place new list at tail of remaining
+              (*remaining_last_item_posted)(&_items_posted);
+              _items_posted = std::move(remaining);
+            }
+            _nonzero_items_posted.store(true, std::memory_order_release);
+            return count;
+          }
+        }
+      } while(count < max_items);
+      return count;
     }
-    return false;
+    return 0;
   }
 
 public:
