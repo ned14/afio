@@ -44,6 +44,11 @@ LLFIO_V2_NAMESPACE_EXPORT_BEGIN
 class fs_handle;
 class io_multiplexer;
 
+namespace detail
+{
+  struct io_operation_connection;
+}
+
 #pragma pack(push, 4)
 
 /*! \class handle
@@ -198,9 +203,19 @@ public:
 protected:
   // vptr takes 4 or 8 bytes
   io_multiplexer *_ctx{nullptr};  // 8 or 16 bytes
-  native_handle_type _v;      // 16 or 28 bytes
+  native_handle_type _v;          // 16 or 28 bytes
   caching _caching{caching::none};
-  uint8_t _spare1{0};       // used by pipe_handle on Windows to store connectedness
+  union {
+    uint8_t _is_initializer{0};
+    struct
+    {
+      uint8_t _is_connected : 1;  // used by pipe_handle on Windows to store connectedness
+#ifdef _WIN32
+      uint8_t _multiplexer_is_apc : 1;
+      uint8_t _multiplexer_is_iocp : 1;
+#endif
+    };
+  };
   uint16_t _spare2{0};      // 20 or 32 bytes
   flag _flags{flag::none};  // 24 or 36 bytes
 
@@ -225,7 +240,7 @@ public:
       : _ctx(o._ctx)
       , _v(std::move(o._v))
       , _caching(o._caching)
-      , _spare1(o._spare1)
+      , _is_initializer(o._is_initializer)
       , _spare2(o._spare2)
       , _flags(o._flags)
   {
@@ -368,6 +383,25 @@ public:
   flag flags() const noexcept { return _flags; }
   //! The native handle used by this handle
   native_handle_type native_handle() const noexcept { return _v; }
+
+public:
+  enum class _async_op
+  {
+    unknown,
+    read,
+    write,
+    barrier
+  };
+#ifdef _WIN32
+  // Used async_io_sender to figure out which implementation to use
+  bool _is_multiplexer_apc() const noexcept { return _multiplexer_is_apc; }
+  bool _is_multiplexer_iocp() const noexcept { return _multiplexer_is_iocp; }
+
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _apc_begin(_async_op /*unused*/, detail::io_operation_connection * /*unused*/, void * /*unused*/) noexcept { abort(); }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _apc_cancel(detail::io_operation_connection * /*unused*/, void * /*unused*/) noexcept { abort(); }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _iocp_begin(_async_op /*unused*/, detail::io_operation_connection * /*unused*/, void * /*unused*/) noexcept { abort(); }
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _iocp_cancel(detail::io_operation_connection * /*unused*/, void * /*unused*/) noexcept { abort(); }
+#endif
 };
 static_assert((sizeof(void *) == 4 && sizeof(handle) == 24) || (sizeof(void *) == 8 && sizeof(handle) == 36), "handle is not 24 or 36 bytes in size!");
 

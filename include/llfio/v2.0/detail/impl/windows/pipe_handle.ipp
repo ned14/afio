@@ -115,7 +115,7 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
       }
       // If writable and not readable, fail if other end is not connected
       // This matches full duplex pipe behaviour on Linux
-      if(nativeh.is_readable() && nativeh.is_writable() && 0xC00000AE /*STATUS_PIPE_BUSY*/ == ntstat)
+      if(nativeh.is_readable() && nativeh.is_writable() && (NTSTATUS) 0xC00000AE /*STATUS_PIPE_BUSY*/ == ntstat)
       {
         return errc::no_such_device_or_address;  // ENXIO, as per Linux
       }
@@ -126,7 +126,7 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
       }
       // loop
     }
-    ret.value()._set_is_connected(true);
+    ret.value()._is_connected=true;
   }
   else
   {
@@ -155,7 +155,7 @@ result<pipe_handle> pipe_handle::pipe(pipe_handle::path_view_type path, pipe_han
       {
         return win32_error();
       }
-      ret.value()._set_is_connected(true);
+      ret.value()._is_connected=true;
     }
   }
   return ret;
@@ -208,7 +208,7 @@ pipe_handle::io_result<pipe_handle::buffers_type> pipe_handle::read(pipe_handle:
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   // If not connected, it'll be non-blocking, so connect now.
-  if(!_is_connected())
+  if(!_is_connected)
   {
     LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
     OVERLAPPED ol{};
@@ -241,7 +241,7 @@ pipe_handle::io_result<pipe_handle::buffers_type> pipe_handle::read(pipe_handle:
         d = deadline(remaining);
       }
     }
-    _set_is_connected(true);
+    _is_connected=true;
   }
   return io_handle::read(reqs, d);
 }

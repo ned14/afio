@@ -41,6 +41,41 @@ namespace this_thread
     return _thread_multiplexer;
   }
   LLFIO_HEADERS_ONLY_FUNC_SPEC void set_multiplexer(io_multiplexer *ctx) noexcept { _thread_multiplexer = ctx; }
+
+  static LLFIO_THREAD_LOCAL struct delay_invoking_io_completion_state
+  {
+    detail::io_operation_connection *begin{nullptr}, *end{nullptr};
+    int count{0};
+  } _delay_invoking_io_completion_state;
+  void delay_invoking_io_completion::add(detail::io_operation_connection *op)
+  {
+    if(_delay_invoking_io_completion_state.count == 0)
+    {
+      op->_complete_io(result<size_t>(0));
+      return;
+    }
+    op->next = nullptr;
+    if(_delay_invoking_io_completion_state.begin == nullptr)
+    {
+      _delay_invoking_io_completion_state.begin = op;
+      _delay_invoking_io_completion_state.end = op;
+      return;
+    }
+    _delay_invoking_io_completion_state.end->delay_invoking_next = op;
+  }
+  delay_invoking_io_completion::delay_invoking_io_completion() { ++_delay_invoking_io_completion_state.count; }
+  delay_invoking_io_completion::~delay_invoking_io_completion()
+  {
+    if(--_delay_invoking_io_completion_state.count)
+    {
+      detail::io_operation_connection *op;
+      while((op = _delay_invoking_io_completion_state.begin) != nullptr)
+      {
+        _delay_invoking_io_completion_state.begin = op->delay_invoking_next;
+        op->_complete_io(result<size_t>(0));
+      }
+    }
+  }
 }  // namespace this_thread
 
 template <bool threadsafe> class io_multiplexer_impl : public io_multiplexer
@@ -161,7 +196,11 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multi
 #elif defined(__FreeBSD__) || defined(__APPLE__)
   return io_multiplexer::bsd_kqueue(threads);
 #elif defined(_WIN32)
-  return io_multiplexer::win_iocp(threads);
+  if(threads > 1)
+  {
+    return io_multiplexer::win_iocp(threads);
+  }
+  return io_multiplexer::win_alertable();
 #else
 #error Unknown platform
   return errc::not_supported;

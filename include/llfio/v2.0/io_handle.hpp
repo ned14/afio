@@ -138,7 +138,11 @@ public:
     }
     if(c != nullptr)
     {
-      OUTCOME_TRY(c->_register_io_handle(this));
+      OUTCOME_TRY(type, c->_register_io_handle(this));
+#ifdef _WIN32
+      this->_multiplexer_is_apc = (type == 0);
+      this->_multiplexer_is_iocp = (type == 1);
+#endif
     }
     this->_ctx = c;
     return success();
@@ -254,8 +258,15 @@ public:
 
   LLFIO_DEADLINE_TRY_FOR_UNTIL(barrier)
 
-  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC const detail::io_operation_visitor &_get_async_io_visitor() noexcept;
+public:
+#ifdef _WIN32
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _apc_begin(_async_op what, detail::io_operation_connection *op, void *_reqs) noexcept override;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _apc_cancel(detail::io_operation_connection *op, void *_reqs) noexcept override;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _iocp_begin(_async_op what, detail::io_operation_connection *op, void *_reqs) noexcept override;
+  LLFIO_HEADERS_ONLY_VIRTUAL_SPEC void _iocp_cancel(detail::io_operation_connection *op, void *_reqs) noexcept override;
+#endif
 
+public:
   /*! \brief Return a non-threadsafe coroutine awaitable which when awaited upon,
   begins the i/o. If the i/o completes immediately, the coroutine is never suspended.
   Otherwise the coroutine is suspended until the i/o completes.

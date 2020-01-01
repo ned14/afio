@@ -58,7 +58,9 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<symlink_handle> symlink_handle::symlink(c
       HANDLE token;
       if(OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token))
       {
-        TOKEN_PRIVILEGES privs = {1};
+        TOKEN_PRIVILEGES privs;
+        memset(&privs, 0, sizeof(privs));
+        privs.PrivilegeCount = 1;
         if(LookupPrivilegeValueW(NULL, L"SeCreateSymbolicLinkPrivilege", &privs.Privileges[0].Luid))
         {
           privs.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;

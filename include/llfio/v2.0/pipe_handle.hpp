@@ -87,9 +87,6 @@ class LLFIO_DECL pipe_handle : public io_handle, public fs_handle
 {
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC const handle &_get_handle() const noexcept final { return *this; }
 
-  void _set_is_connected(bool v) noexcept { this->_spare1 = v; }
-  bool _is_connected() const noexcept { return this->_spare1 != 0; }
-
 public:
   using path_type = io_handle::path_type;
   using extent_type = io_handle::extent_type;

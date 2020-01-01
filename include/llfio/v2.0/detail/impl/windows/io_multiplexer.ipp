@@ -44,97 +44,22 @@ namespace detail
 #endif
 }  // namespace detail
 
-template <bool threadsafe> class win_iocp_impl final : public io_multiplexer_impl<threadsafe>
+template <bool threadsafe> class win_common_impl : public io_multiplexer_impl<threadsafe>
 {
   using _base = io_multiplexer_impl<threadsafe>;
+
+protected:
   using _lock_guard = typename _base::_lock_guard;
-  template <class T> using atomic_type = std::conditional_t<threadsafe, std::atomic<T>, detail::fake_atomic<T>>;
 
-  static_assert(sizeof(typename detail::io_operation_connection::_OVERLAPPED) == sizeof(OVERLAPPED), "detail::io_operation_connection::_OVERLAPPED does not match OVERLAPPED!");
-
-  atomic_type<size_t> _concurrent_run_instances{0};  // how many threads inside wait() there are right now
-  atomic_type<size_t> _total_pending_io{0};          // how many pending i/o there are right now
-  // Linked list of all deadlined i/o's pending completion
-  detail::io_operation_connection *_pending_begin{nullptr}, *_pending_end{nullptr};
+  // Deadlined i/o ONLY
+  detail::io_operation_connection *_scheduled_begin{nullptr}, *_scheduled_end{nullptr};
+  // All i/o for which the OS is done with the state
+  detail::io_operation_connection *_completed_begin{nullptr}, *_completed_end{nullptr};
 
   // ONLY if _do_timeout_io() is called
   std::multimap<std::chrono::steady_clock::time_point, detail::io_operation_connection *> _durations;
   std::multimap<std::chrono::system_clock::time_point, detail::io_operation_connection *> _absolutes;
 
-public:
-  result<void> init(size_t threads)
-  {
-    this->_v.h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, (DWORD) threads);
-    if(nullptr == this->_v.h)
-    {
-      return win32_error();
-    }
-    return success();
-  }
-  virtual ~win_iocp_impl()
-  {
-    this->_lock.lock();
-    if(_total_pending_io.load(std::memory_order_acquire) > 0)
-    {
-      LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with i/o handles still doing work");
-      abort();
-    }
-    (void) CloseHandle(this->_v.h);
-  }
-
-  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
-  {
-    _base::_post(std::move(f));
-    // Poke IOCP to wake
-    PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
-  }
-
-  virtual result<void> _register_io_handle(handle *h) noexcept override final
-  {
-    windows_nt_kernel::init();
-    using namespace windows_nt_kernel;
-    LLFIO_LOG_FUNCTION_CALL(this);
-    IO_STATUS_BLOCK isb = make_iostatus();
-    FILE_COMPLETION_INFORMATION fci{};
-    memset(&fci, 0, sizeof(fci));
-    fci.Port = this->_v.h;
-    fci.Key = (void *) 1;  // not null
-    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileCompletionInformation);
-    if(STATUS_PENDING == ntstat)
-    {
-      ntstat = ntwait(h->native_handle().h, isb, deadline());
-    }
-    if(ntstat < 0)
-    {
-      return ntkernel_error(ntstat);
-    }
-    // Don't wake run() for i/o which completes immediately. We ignore
-    // failure as not all handles support this, and we are idempotent to
-    // spurious wakes in any case.
-    SetFileCompletionNotificationModes(h->native_handle().h, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE);
-    return success();
-  }
-  virtual result<void> _deregister_io_handle(handle *h) noexcept override final
-  {
-    windows_nt_kernel::init();
-    using namespace windows_nt_kernel;
-    LLFIO_LOG_FUNCTION_CALL(this);
-    IO_STATUS_BLOCK isb = make_iostatus();
-    FILE_COMPLETION_INFORMATION fci{};
-    memset(&fci, 0, sizeof(fci));
-    fci.Port = nullptr;
-    fci.Key = nullptr;
-    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
-    if(STATUS_PENDING == ntstat)
-    {
-      ntstat = ntwait(h->native_handle().h, isb, deadline());
-    }
-    if(ntstat < 0)
-    {
-      return ntkernel_error(ntstat);
-    }
-    return success();
-  }
 
   virtual result<int> invoke_posted_items(int max_items = -1, deadline d = deadline()) noexcept override final
   {
@@ -147,20 +72,20 @@ public:
     try
     {
       span<detail::io_operation_connection *> out(in.data(), (size_t) 0);
-      for(auto *i = _pending_end; i != nullptr && !i->is_added_to_deadline_list; i = i->prev)
+      for(auto *i = _scheduled_end; i != nullptr && !i->is_added_to_deadline_list; i = i->prev)
       {
-        if(i->deadline_absolute != std::chrono::system_clock::time_point())
+        if(i->deadline_duration != std::chrono::steady_clock::time_point())
         {
-          auto it = _absolutes.insert({i->deadline_absolute, i});
-          if(it == _absolutes.begin())
+          auto it = _durations.insert({i->deadline_duration, i});
+          if(it == _durations.begin())
           {
             need_to_wake_all = true;
           }
         }
-        else if(i->deadline_duration != std::chrono::steady_clock::time_point())
+        else
         {
-          auto it = _durations.insert({i->deadline_duration, i});
-          if(it == _durations.begin())
+          auto it = _absolutes.insert({i->d.to_time_point(), i});
+          if(it == _absolutes.begin())
           {
             need_to_wake_all = true;
           }
@@ -224,6 +149,7 @@ public:
 
   virtual result<int> timeout_io(int max_items = -1, deadline d = deadline()) noexcept override final
   {
+    using poll_kind = typename detail::io_operation_connection::_poll_kind;
     LLFIO_LOG_FUNCTION_CALL(this);
     if(max_items < 0)
     {
@@ -244,7 +170,7 @@ public:
     int count = 0;
     for(auto *i : out)
     {
-      i->poll();
+      i->_poll(poll_kind::timeout);
       ++count;
       if(max_items == count)
       {
@@ -261,73 +187,341 @@ public:
     return count;
   }
 
-  result<int> _do_complete_io(LARGE_INTEGER *timeout, int max_items) noexcept
+  void _add_to_scheduled(detail::io_operation_connection *op, bool tofront = false) noexcept
   {
+    assert(op->d);
+    assert(!op->is_scheduled);
+    if(tofront)
+    {
+      op->next = _scheduled_begin;
+      op->prev = nullptr;
+      if(_scheduled_begin == nullptr)
+      {
+        _scheduled_end = op;
+      }
+      else
+      {
+        _scheduled_begin->prev = op;
+      }
+      _scheduled_begin = op;
+    }
+    else
+    {
+      op->next = nullptr;
+      op->prev = _scheduled_end;
+      if(_scheduled_end == nullptr)
+      {
+        _scheduled_begin = op;
+      }
+      else
+      {
+        _scheduled_end->next = op;
+      }
+      _scheduled_end = op;
+    }
+    op->is_scheduled = true;
+  }
+  void _remove_from_scheduled(detail::io_operation_connection *op) noexcept
+  {
+    assert(op->d);
+    assert(op->is_scheduled);
+    if(op->prev == nullptr)
+    {
+      _scheduled_begin = op->next;
+    }
+    else
+    {
+      op->prev->next = op->next;
+    }
+    if(op->next == nullptr)
+    {
+      _scheduled_end = op->prev;
+    }
+    else
+    {
+      op->next->prev = op->prev;
+    }
+    op->is_scheduled = false;
+  }
+  void _add_to_completed(detail::io_operation_connection *op) noexcept
+  {
+    assert(!op->is_os_completed);
+    op->next = nullptr;
+    op->prev = _completed_end;
+    if(_completed_end == nullptr)
+    {
+      _completed_begin = op;
+    }
+    else
+    {
+      _completed_end->next = op;
+    }
+    _completed_end = op;
+    op->is_os_completed = true;
+  }
+  void _remove_from_completed(detail::io_operation_connection *op) noexcept
+  {
+    assert(op->is_os_completed);
+    if(op->prev == nullptr)
+    {
+      _completed_begin = op->next;
+    }
+    else
+    {
+      op->prev->next = op->next;
+    }
+    if(op->next == nullptr)
+    {
+      _completed_end = op->prev;
+    }
+    else
+    {
+      op->next->prev = op->prev;
+    }
+    op->is_os_completed = false;
+  }
+  void _remove_from_deadline_list(detail::io_operation_connection *op) noexcept
+  {
+    if(op->is_added_to_deadline_list)
+    {
+      if(op->deadline_duration != std::chrono::steady_clock::time_point())
+      {
+        auto it = _durations.find(op->deadline_duration);
+        if(it == _durations.end())
+        {
+          abort();
+        }
+        bool found = false;
+        do
+        {
+          if(it->second == op)
+          {
+            _durations.erase(it);
+            found = true;
+            break;
+          }
+          ++it;
+        } while(it != _durations.end() && it->first == op->deadline_duration);
+        if(!found)
+        {
+          abort();
+        }
+      }
+      else
+      {
+        const auto deadline_absolute = op->d.to_time_point();
+        auto it = _absolutes.find(deadline_absolute);
+        if(it == _absolutes.end())
+        {
+          abort();
+        }
+        bool found = false;
+        do
+        {
+          if(it->second == op)
+          {
+            _absolutes.erase(it);
+            found = true;
+            break;
+          }
+          ++it;
+        } while(it != _absolutes.end() && it->first == deadline_absolute);
+        if(!found)
+        {
+          abort();
+        }
+      }
+      op->is_added_to_deadline_list = false;
+    }
+  }
+  void _reschedule_io(detail::io_operation_connection *op) noexcept
+  {
+    // An unfinished i/o in the completed list is being put back into scheduled
+    assert(op->is_os_completed);
+    _remove_from_completed(op);
+    if(op->d)
+    {
+      // MUST add to front of list, else it breaks ordered list calculation
+      _add_to_scheduled(op, true);
+    }
+    op->is_scheduled = true;
+  }
+  virtual void _scheduled_io(detail::io_operation_connection *op) noexcept override final
+  {
+    //std::cerr << "_scheduled_io " << op << std::endl;
+    assert(!op->is_scheduled);
+    // Add this state to the list of scheduled i/o if and only if it has a deadline
+    // Only at the point of wait will unseen pending i/o be merged into the
+    // ordered lists of expiring i/o
+    if(op->d)
+    {
+      _lock_guard g(this->_lock);
+      _add_to_scheduled(op);
+
+      // FIXME On IOCP where we are threadsafe we need to wake any currently
+      // idling thread to recalculate the global ordered timeout list
+    }
+    op->is_scheduled = true;
+  }
+  virtual void _os_has_completed_io(detail::io_operation_connection *op) noexcept override final
+  {
+    //std::cerr << "_os_has_completed_io " << op << " delayed_completion=" << op->is_scheduled << std::endl;
+    assert(!op->is_os_completed);
+    _lock_guard g(this->_lock);
+    if(op->is_scheduled)
+    {
+      if(op->d)
+      {
+        _remove_from_scheduled(op);
+      }
+      op->is_scheduled = false;
+    }
+    _add_to_completed(op);
+  }
+  void _done_io(detail::io_operation_connection *op, _lock_guard &g) noexcept
+  {
+    //std::cerr << "_done_io " << op << std::endl;
+    //assert(op->is_os_completed);
+    assert(!op->is_done_set);
+    _remove_from_deadline_list(op);
+    if(op->is_os_completed)
+    {
+      _remove_from_completed(op);
+    }
+    // Won't cancel a completed operation, but will call the Receiver's .set_done()
+    g.unlock();
+    op->cancel();
+    g.lock();
+  }
+};
+
+class win_alertable_impl final : public win_common_impl<false>
+{
+  using _base = win_common_impl<false>;
+  using _lock_guard = typename _base::_lock_guard;
+
+  DWORD _owning_tid{0};
+
+public:
+  result<void> init()
+  {
+    // Duplicate a true handle to the calling thread
+    if(!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &this->_v.h, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+      return win32_error();
+    }
+    _owning_tid = GetCurrentThreadId();
+    return success();
+  }
+  virtual ~win_alertable_impl()
+  {
+    this->_lock.lock();
+    if(_scheduled_begin != nullptr || _completed_begin != nullptr || !_durations.empty() || !_absolutes.empty())
+    {
+      LLFIO_LOG_FATAL(nullptr, "win_alertable_impl::~win_alertable_impl() called with i/o handles still doing work");
+      abort();
+    }
+    (void) CloseHandle(this->_v.h);
+  }
+
+  static void _invoke_posted_items_thunk(ULONG_PTR p)
+  {
+    auto *self = (win_alertable_impl *) p;
+    if(!self->invoke_posted_items())
+    {
+      abort();
+    }
+  }
+  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
+  {
+    _base::_post(std::move(f));
+    // Poke my thread to execute posted items
+    if(!QueueUserAPC(_invoke_posted_items_thunk, this->_v.h, (ULONG_PTR) this))
+    {
+      abort();
+    }
+  }
+
+  virtual result<int> _register_io_handle(handle * /*unused*/) noexcept override final { return 0; }
+  virtual result<void> _deregister_io_handle(handle * /*unused*/) noexcept override final { return success(); }
+
+  result<int> _do_complete_io(LARGE_INTEGER *timeout, int max_items, deadline d) noexcept
+  {
+    using poll_kind = typename detail::io_operation_connection::_poll_kind;
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
-    if(_total_pending_io.load(std::memory_order_acquire) == 0)
+    if(_owning_tid != GetCurrentThreadId())
     {
-      return 0;
+      return errc::operation_not_permitted;
     }
+    LLFIO_DEADLINE_TO_SLEEP_INIT(d);
 
-    OVERLAPPED_ENTRY entries[64];
-    ULONG filled = 0;
-    if(max_items < 0)
-    {
-      max_items = INT_MAX;
-    }
-    if(max_items > sizeof(entries) / sizeof(entries[0]))
-    {
-      max_items = (int) (sizeof(entries) / sizeof(entries[0]));
-    }
-    NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, (unsigned) max_items, &filled, timeout, false);
+    /* This will execute all APCs enqueued. If more are enqueued by the
+    execution of the APCs, this will block forever. Our APC routines
+    therefore simply call _completed_io(), which adds them to the
+    completed i/o list.
+    */
+    NTSTATUS ntstat = NtDelayExecution(1u, timeout);
     if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
     {
       return ntkernel_error(ntstat);
     }
-    if(filled == 0 || ntstat == STATUS_TIMEOUT)
+    if(ntstat == STATUS_TIMEOUT)
     {
-      return -(int) _total_pending_io.load(std::memory_order_acquire);
+      return -1;
+    }
+
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
     }
     int count = 0;
-    for(ULONG n = 0; n < filled; n++)
+    this_thread::delay_invoking_io_completion invoker;
+    _lock_guard g(this->_lock);
+    const auto *end = _completed_end;
+    while(_completed_begin != nullptr && count++ < max_items)
     {
-      // If it's null, this is a post() wakeup
-      if(entries[n].lpCompletionKey == 0)
+      auto *begin = _completed_begin;
+      const bool done_all = (begin == end);
+      g.unlock();
+      // See if all i/o requests are now complete, if so complete the op
+      if(begin->_poll(poll_kind::check) == io_state_status::completed)
       {
-        continue;
-      }
-      auto *states = (std::vector<detail::io_operation_connection *> *) entries[n].lpCompletionKey;
-      (void) states;
-      // Complete the i/o
-      auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
-      if(!op->is_cancelled_io)
-      {
-        op->poll();
-        ++count;
+        g.lock();
+        _done_io(begin, g);
       }
       else
       {
-        op->is_cancelled_io = false;
+        // Not quite done yet
+        g.lock();
+        _reschedule_io(begin);
       }
-    }
-    if(count == 0)
-    {
-      return -(int) _total_pending_io.load(std::memory_order_acquire);
+      if(done_all)
+      {
+        break;
+      }
+      if(d)
+      {
+        if((d.steady && (d.nsecs == 0 || std::chrono::steady_clock::now() >= began_steady)) || (!d.steady && std::chrono::system_clock::now() >= end_utc))
+        {
+          break;
+        }
+      }
     }
     return count;
   }
 
-  virtual result<int> complete_io(int max_items = -1, deadline /*unused*/ = deadline()) noexcept override final
+  virtual result<int> complete_io(int max_items = -1, deadline d = deadline()) noexcept override final
   {
     LLFIO_LOG_FUNCTION_CALL(this);
     LARGE_INTEGER timeout;
     memset(&timeout, 0, sizeof(timeout));  // poll don't block
-    return _do_complete_io(&timeout, max_items);
+    return _do_complete_io(&timeout, max_items, d);
   }
 
   result<int> run(int max_items = -1, deadline d = deadline()) noexcept override final
   {
+    using poll_kind = typename detail::io_operation_connection::_poll_kind;
     LLFIO_LOG_FUNCTION_CALL(this);
     if(max_items < 0)
     {
@@ -342,9 +536,209 @@ public:
       {
         return count;
       }
-      if(count==0 && _total_pending_io.load(std::memory_order_acquire) == 0)
+      LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
+
+      // Figure out how long we can sleep the thread for
+      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
+      bool need_to_wake_all = false;
+      detail::io_operation_connection *in[64];
+      _lock_guard g(this->_lock);
+      OUTCOME_TRY(out, _do_timeout_io(_timeout, timeout, need_to_wake_all, {(detail::io_operation_connection **) in, (size_t) std::min(64, max_items - count)}));
+      g.unlock();
+      if(!out.empty())
       {
-        return 0;  // there is nothing to block on
+        for(auto *i : out)
+        {
+          i->_poll(poll_kind::timeout);
+          ++count;
+          if(max_items == count)
+          {
+            return count;
+          }
+          LLFIO_DEADLINE_TO_TIMEOUT_LOOP(d);
+        }
+        // No need to adjust timeout after executing completions as
+        // we zero the timeout below anyway
+      }
+
+      // timeout will be the lesser of the next pending i/o to expire,
+      // or the deadline passed into us. If we've done any work at all,
+      // only poll for i/o completions so we return immediately after.
+      if(count > 0)
+      {
+        timeout->QuadPart = 0;
+      }
+      deadline nd;
+      LLFIO_DEADLINE_TO_PARTIAL_DEADLINE(nd, d);
+      OUTCOME_TRY(items, _do_complete_io(timeout, max_items - count, nd));
+      count += items;
+      if(count > 0)
+      {
+        return count;
+      }
+      // Loop if no work done, as either there are new posted items or
+      // we have timed out
+    }
+  }
+};
+
+template <bool threadsafe> class win_iocp_impl final : public win_common_impl<threadsafe>
+{
+  using _base = win_common_impl<threadsafe>;
+  using _lock_guard = typename _base::_lock_guard;
+  template <class T> using atomic_type = std::conditional_t<threadsafe, std::atomic<T>, detail::fake_atomic<T>>;
+
+  atomic_type<size_t> _concurrent_run_instances{0};  // how many threads inside wait() there are right now
+
+public:
+  result<void> init(size_t threads)
+  {
+    this->_v.h = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, (DWORD) threads);
+    if(nullptr == this->_v.h)
+    {
+      return win32_error();
+    }
+    return success();
+  }
+  virtual ~win_iocp_impl()
+  {
+    this->_lock.lock();
+    if(_scheduled_begin != nullptr || _completed_begin != nullptr || !_durations.empty() || !_absolutes.empty())
+    {
+      LLFIO_LOG_FATAL(nullptr, "win_iocp_impl::~win_iocp_impl() called with i/o handles still doing work");
+      abort();
+    }
+    (void) CloseHandle(this->_v.h);
+  }
+
+  virtual void _post(function_ptr<void *(void *)> &&f) noexcept override final
+  {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
+    _base::_post(std::move(f));
+    // Poke my thread to execute posted items
+    NtSetIoCompletion(this->_v.h, 0, nullptr, 0, 0);
+  }
+
+  virtual result<int> _register_io_handle(handle *h) noexcept override final
+  {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
+    LLFIO_LOG_FUNCTION_CALL(this);
+    IO_STATUS_BLOCK isb = make_iostatus();
+    FILE_COMPLETION_INFORMATION fci{};
+    memset(&fci, 0, sizeof(fci));
+    fci.Port = this->_v.h;
+    fci.Key = nullptr;
+    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileCompletionInformation);
+    if(STATUS_PENDING == ntstat)
+    {
+      ntstat = ntwait(h->native_handle().h, isb, deadline());
+    }
+    if(ntstat < 0)
+    {
+      return ntkernel_error(ntstat);
+    }
+    return 1;
+  }
+  virtual result<void> _deregister_io_handle(handle *h) noexcept override final
+  {
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
+    LLFIO_LOG_FUNCTION_CALL(this);
+    IO_STATUS_BLOCK isb = make_iostatus();
+    FILE_COMPLETION_INFORMATION fci{};
+    memset(&fci, 0, sizeof(fci));
+    fci.Port = nullptr;
+    fci.Key = nullptr;
+    NTSTATUS ntstat = NtSetInformationFile(h->native_handle().h, &isb, &fci, sizeof(fci), FileReplaceCompletionInformation);
+    if(STATUS_PENDING == ntstat)
+    {
+      ntstat = ntwait(h->native_handle().h, isb, deadline());
+    }
+    if(ntstat < 0)
+    {
+      return ntkernel_error(ntstat);
+    }
+    return success();
+  }
+
+  result<int> _do_complete_io(LARGE_INTEGER *timeout, int max_items) noexcept
+  {
+    using poll_kind = typename detail::io_operation_connection::_poll_kind;
+    windows_nt_kernel::init();
+    using namespace windows_nt_kernel;
+
+    FILE_IO_COMPLETION_INFORMATION entries[64];
+    ULONG filled = 0;
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
+    }
+    if(max_items > (int) (sizeof(entries) / sizeof(entries[0])))
+    {
+      max_items = (int) (sizeof(entries) / sizeof(entries[0]));
+    }
+#if 1
+    NTSTATUS ntstat = NtRemoveIoCompletion(this->_v.h, &entries[0].KeyContext, &entries[0].ApcContext, &entries[0].IoStatusBlock, timeout);
+    filled = 1;
+#else
+    NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, (unsigned) max_items, &filled, timeout, false);
+#endif
+    if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
+    {
+      return ntkernel_error(ntstat);
+    }
+    if(filled == 0 || ntstat == STATUS_TIMEOUT)
+    {
+      return -1;
+    }
+    int count = 0;
+    this_thread::delay_invoking_io_completion invoker;
+    for(ULONG n = 0; n < filled; n++)
+    {
+      // The context is the i/o state
+      auto *op = (detail::io_operation_connection *) entries[n].ApcContext;
+      if(op == nullptr)
+      {
+        // post() poke
+        continue;
+      }
+      // See if all i/o requests are now complete, if so complete the op
+      if(op->_poll(poll_kind::check) == io_state_status::completed)
+      {
+        _lock_guard g(this->_lock);
+        _done_io(op, g);
+      }
+      ++count;
+    }
+    return count;
+  }
+
+  virtual result<int> complete_io(int max_items = -1, deadline /*unused*/ = deadline()) noexcept override final
+  {
+    LLFIO_LOG_FUNCTION_CALL(this);
+    LARGE_INTEGER timeout;
+    memset(&timeout, 0, sizeof(timeout));  // poll don't block
+    return _do_complete_io(&timeout, max_items);
+  }
+
+  result<int> run(int max_items = -1, deadline d = deadline()) noexcept override final
+  {
+    using poll_kind = typename detail::io_operation_connection::_poll_kind;
+    LLFIO_LOG_FUNCTION_CALL(this);
+    if(max_items < 0)
+    {
+      max_items = INT_MAX;
+    }
+    int count = 0;
+    LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
+    for(;;)
+    {
+      count += this->_execute_posted_items(max_items, d);
+      if(max_items == count)
+      {
+        return count;
       }
       LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
 
@@ -372,7 +766,7 @@ public:
       {
         for(auto *i : out)
         {
-          i->poll();
+          i->_poll(poll_kind::timeout);
           ++count;
           if(max_items == count)
           {
@@ -401,215 +795,21 @@ public:
       // we have timed out
     }
   }
-
-#if 0
-  virtual result<int> _do_run(bool nonblocking, deadline d) noexcept override final
-  {
-    windows_nt_kernel::init();
-    using namespace windows_nt_kernel;
-    LLFIO_LOG_FUNCTION_CALL(this);
-    LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
-    for(;;)
-    {
-      if(check_posted_items())
-      {
-        return 1;
-      }
-      if(d && d.nsecs == 0 && _total_pending_io.load(std::memory_order_acquire) == 0)
-      {
-        return 0;  // there is nothing to block on
-      }
-      _lock_guard g(this->_lock);
-
-      // First check if any timeouts have passed, complete those if they have
-      bool need_to_wake_all = false;
-      LLFIO_WIN_DEADLINE_TO_SLEEP_LOOP(d);  // recalculate our timeout
-      OUTCOME_TRY(resume_timed_out, _do_timeout_io(_timeout, timeout, need_to_wake_all));
-      if(nonblocking)
-      {
-        timeout = &_timeout;
-        _timeout.QuadPart = 0;
-      }
-      if(need_to_wake_all)
-      {
-        // Timeouts ought to be processed by all idle threads concurrently, so wake everything
-        auto threads_sleeping = _concurrent_run_instances.load(std::memory_order_acquire);
-        for(size_t n = 0; n < threads_sleeping; n++)
-        {
-          PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
-        }
-      }
-      if(resume_timed_out != nullptr)
-      {
-        g.unlock();
-        // We need to do one more check if the i/o has completed before timing out
-        resume_timed_out->poll();
-        return 1;
-      }
-
-      OVERLAPPED_ENTRY entries[64];
-      ULONG filled = 0;
-      NTSTATUS ntstat;
-      {
-        _concurrent_run_instances.fetch_add(1, std::memory_order_acq_rel);
-        g.unlock();
-        // Use this instead of GetQueuedCompletionStatusEx() as this implements absolute timeouts
-        ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, sizeof(entries) / sizeof(entries[0]), &filled, timeout, false);
-        _concurrent_run_instances.fetch_sub(1, std::memory_order_acq_rel);
-      }
-      if(STATUS_TIMEOUT == ntstat)
-      {
-        if(nonblocking)
-        {
-          return -(int) _total_pending_io.load(std::memory_order_acquire);
-        }
-        // If the supplied deadline has passed, return errc::timed_out
-        LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
-        continue;
-      }
-      if(ntstat < 0)
-      {
-        return ntkernel_error(ntstat);
-      }
-      size_t post_wakeups = 0;
-      for(ULONG n = 0; n < filled; n++)
-      {
-        // If it's null, this is a post() wakeup
-        if(entries[n].lpCompletionKey == 0)
-        {
-          ++post_wakeups;
-          continue;
-        }
-        auto *states = (std::vector<detail::io_operation_connection *> *) entries[n].lpCompletionKey;
-        (void) states;
-        // Complete the i/o
-        auto *op = (typename detail::io_operation_connection *) entries[n].lpOverlapped->hEvent;
-        if(!op->is_cancelled_io)
-        {
-          op->poll();
-        }
-        else
-        {
-          op->is_cancelled_io = false;
-        }
-      }
-      if(filled - post_wakeups > 0)
-      {
-        return (int) (filled - post_wakeups);
-      }
-    }
-  }
-#endif
-  virtual void _register_pending_io(detail::io_operation_connection *op) noexcept
-  {
-    op->is_registered_with_io_multiplexer = true;
-    _total_pending_io.fetch_add(1, std::memory_order_relaxed);
-    // Add this state to the list of pending i/o if and only if it has a deadline
-    bool need_to_wake = false;
-    if(op->deadline_absolute != std::chrono::system_clock::time_point() || op->deadline_duration != std::chrono::steady_clock::time_point())
-    {
-      _lock_guard g(this->_lock);
-      op->next = nullptr;
-      op->prev = _pending_end;
-      if(_pending_end == nullptr)
-      {
-        _pending_begin = op;
-      }
-      else
-      {
-        _pending_end->next = op;
-      }
-      _pending_end = op;
-      if(_concurrent_run_instances.load(std::memory_order_acquire) > 0)
-      {
-        need_to_wake = true;
-      }
-    }
-    /* If there are run() instances running right now, wake any one of them
-    to recalculate timeouts.
-    */
-    if(need_to_wake)
-    {
-      PostQueuedCompletionStatus(this->_v.h, 0, 0, nullptr);
-    }
-  }
-  virtual void _deregister_pending_io(detail::io_operation_connection *op) noexcept
-  {
-    // If the i/o was cancelled, there may be an IOCP cancellation
-    // packet queued. This needs to be drained before we can tear
-    // down the OVERLAPPED state, otherwise memory corruption will
-    // occur.
-    while(op->is_cancelled_io && complete_io().value() > 0)
-      ;
-    _total_pending_io.fetch_sub(1, std::memory_order_relaxed);
-    if(op->is_added_to_deadline_list)
-    {
-      _lock_guard g(this->_lock);
-      if(op->deadline_absolute != std::chrono::system_clock::time_point())
-      {
-        auto it = _absolutes.find(op->deadline_absolute);
-        if(it == _absolutes.end())
-        {
-          abort();
-        }
-        bool found = false;
-        do
-        {
-          if(it->second == op)
-          {
-            _absolutes.erase(it);
-            found = true;
-            break;
-          }
-          ++it;
-        } while(it != _absolutes.end() && it->first == op->deadline_absolute);
-        if(!found)
-        {
-          abort();
-        }
-      }
-      else if(op->deadline_duration != std::chrono::steady_clock::time_point())
-      {
-        auto it = _durations.find(op->deadline_duration);
-        if(it == _durations.end())
-        {
-          abort();
-        }
-        bool found = false;
-        do
-        {
-          if(it->second == op)
-          {
-            _durations.erase(it);
-            found = true;
-            break;
-          }
-          ++it;
-        } while(it != _durations.end() && it->first == op->deadline_duration);
-        if(!found)
-        {
-          abort();
-        }
-      }
-      if(op->prev == nullptr)
-      {
-        _pending_begin = op->next;
-      }
-      else
-      {
-        op->prev->next = op->next;
-      }
-      if(op->next == nullptr)
-      {
-        _pending_end = op->prev;
-      }
-      else
-      {
-        op->next->prev = op->prev;
-      }
-    }
-  }
 };
+
+LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multiplexer::win_alertable() noexcept
+{
+  try
+  {
+    auto ret = std::make_unique<win_alertable_impl>();
+    OUTCOME_TRY(ret->init());
+    return ret;
+  }
+  catch(...)
+  {
+    return error_from_exception();
+  }
+}
 
 LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::unique_ptr<io_multiplexer>> io_multiplexer::win_iocp(size_t threads) noexcept
 {

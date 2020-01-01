@@ -338,7 +338,18 @@ namespace windows_nt_kernel
 
   using NtDelayExecution_t = NTSTATUS(NTAPI *)(_In_ BOOLEAN Alertable, _In_opt_ LARGE_INTEGER *Interval);
 
-  using NtRemoveIoCompletionEx_t = NTSTATUS(NTAPI *)(_In_ HANDLE IoCompletionHandle, /*PFILE_IO_COMPLETION_INFORMATION*/ LPOVERLAPPED_ENTRY IoCompletionInformation, _In_ ULONG Count, _Out_ PULONG NumEntriesRemoved, _In_opt_ PLARGE_INTEGER Timeout, _In_ BOOLEAN Alertable);
+  using NtSetIoCompletion_t = NTSTATUS(NTAPI *)(_In_ HANDLE IoCompletionHandle, _In_ ULONG KeyContext, _In_ PVOID ApcContext, _In_ NTSTATUS IoStatus, _In_ ULONG IoStatusInformation);
+
+  using NtRemoveIoCompletion_t = NTSTATUS(NTAPI *)(_In_ HANDLE IoCompletionHandle, _Out_ PVOID* CompletionKey, _Out_ PVOID* ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_opt_ PLARGE_INTEGER Timeout);
+
+  typedef struct _FILE_IO_COMPLETION_INFORMATION
+  {
+    PVOID KeyContext;
+    PVOID ApcContext;
+    IO_STATUS_BLOCK IoStatusBlock;
+  } FILE_IO_COMPLETION_INFORMATION, *PFILE_IO_COMPLETION_INFORMATION;
+
+  using NtRemoveIoCompletionEx_t = NTSTATUS(NTAPI *)(_In_ HANDLE IoCompletionHandle, PFILE_IO_COMPLETION_INFORMATION IoCompletionInformation, _In_ ULONG Count, _Out_ PULONG NumEntriesRemoved, _In_opt_ PLARGE_INTEGER Timeout, _In_ BOOLEAN Alertable);
 
   // From https://msdn.microsoft.com/en-us/library/windows/hardware/ff566474(v=vs.85).aspx
   using NtLockFile_t = NTSTATUS(NTAPI *)(_In_ HANDLE FileHandle, _In_opt_ HANDLE Event, _In_opt_ PIO_APC_ROUTINE ApcRoutine, _In_opt_ PVOID ApcContext, _Out_ PIO_STATUS_BLOCK IoStatusBlock, _In_ PLARGE_INTEGER ByteOffset, _In_ PLARGE_INTEGER Length, _In_ ULONG Key, _In_ BOOLEAN FailImmediately,
@@ -622,6 +633,8 @@ namespace windows_nt_kernel
   static NtWaitForSingleObject_t NtWaitForSingleObject;
   static NtWaitForMultipleObjects_t NtWaitForMultipleObjects;
   static NtDelayExecution_t NtDelayExecution;
+  static NtSetIoCompletion_t NtSetIoCompletion;
+  static NtRemoveIoCompletion_t NtRemoveIoCompletion;
   static NtRemoveIoCompletionEx_t NtRemoveIoCompletionEx;
   static NtLockFile_t NtLockFile;
   static NtUnlockFile_t NtUnlockFile;
@@ -798,6 +811,20 @@ namespace windows_nt_kernel
     if(NtDelayExecution == nullptr)
     {
       if((NtDelayExecution = reinterpret_cast<NtDelayExecution_t>(GetProcAddress(ntdllh, "NtDelayExecution"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtSetIoCompletion == nullptr)
+    {
+      if((NtSetIoCompletion = reinterpret_cast<NtSetIoCompletion_t>(GetProcAddress(ntdllh, "NtSetIoCompletion"))) == nullptr)
+      {
+        abort();
+      }
+    }
+    if(NtRemoveIoCompletion == nullptr)
+    {
+      if((NtRemoveIoCompletion = reinterpret_cast<NtRemoveIoCompletion_t>(GetProcAddress(ntdllh, "NtRemoveIoCompletion"))) == nullptr)
       {
         abort();
       }
@@ -1277,11 +1304,11 @@ inline NTSTATUS ntcancel_pending_io(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK
   NTSTATUS ntstat = NtCancelIoFileEx(h, &isb, &isb);
   if(ntstat < 0)
   {
-    if(ntstat == 0xC0000225 /*STATUS_NOT_FOUND*/)
+    if(ntstat == (NTSTATUS) 0xC0000225 /*STATUS_NOT_FOUND*/)
     {
       // In the moment between the check of isb.Status and NtCancelIoFileEx()
       // the i/o completed, so consider this a success.
-      isb.Status = 0xC0000120 /*STATUS_CANCELLED*/;
+      isb.Status = (NTSTATUS) 0xC0000120 /*STATUS_CANCELLED*/;
       return isb.Status;
     }
     return ntstat;
@@ -1313,7 +1340,7 @@ inline NTSTATUS ntwait(HANDLE h, windows_nt_kernel::IO_STATUS_BLOCK &isb, const 
     {
       // If he'll still pending, we must cancel the i/o
       ntstat = ntcancel_pending_io(h, isb);
-      if(ntstat < 0 && ntstat != 0xC0000120 /*STATUS_CANCELLED*/)
+      if(ntstat < 0 && ntstat != (NTSTATUS) 0xC0000120 /*STATUS_CANCELLED*/)
       {
         LLFIO_LOG_FATAL(nullptr, "Failed to cancel earlier i/o");
         abort();

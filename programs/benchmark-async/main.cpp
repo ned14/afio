@@ -23,35 +23,81 @@ Distributed under the Boost Software License, Version 1.0.
 */
 
 //! Seconds to run the benchmark
-static constexpr size_t BENCHMARK_DURATION = 10;
+static constexpr int BENCHMARK_DURATION = 10;
 
 static constexpr size_t THREADS = 2;
+
+/* ASIO IOCP (uses shared ptrs to i/o state enabling early
+completion and late destruction):
+
+Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
+   creates 12500 reads 205124 cancels 64516.1 destroys 66225.2
+
+Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
+   creates 11337.9 reads 202470 cancels 69444.4 destroys 68027.2
+
+Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
+   creates 17921.1 reads 208869 cancels 58479.5 destroys 68027.2
+
+
+LLFIO IOCP (NtRemoveIoCompletion executes state release):
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 27173.9 reads 182966 cancels 303030 destroys 44052.9
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 23041.5 reads 180083 cancels 285714 destroys 51813.5
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 23201.9 reads 179958 cancels 256410 destroys 49019.6
+
+
+LLFIO Alertable (APCs enqueue state release):
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 23640.7 reads 111594 cancels 434783 destroys 9794.32
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 24937.7 reads 111980 cancels 454545 destroys 10493.2
+*/
 
 #include "../../include/llfio/llfio.hpp"
 
 #include "quickcpplib/algorithm/small_prng.hpp"
 
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <thread>
+#include <typeinfo>
 #include <vector>
 
 #if __has_include("asio/include/asio.hpp")
 #define ENABLE_ASIO 1
+#if defined(__clang__) && defined(_MSC_VER)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmicrosoft-include"
+#endif
 #include "asio/include/asio.hpp"
+#if defined(__clang__) && defined(_MSC_VER)
+#pragma clang diagnostic pop
+#endif
 #endif
 
 namespace llfio = LLFIO_V2_NAMESPACE;
 
 struct test_results
 {
-  double creation{0}, ops{0}, cancel{0} , destruction{0};
+  int handles{0};
+  double creation{0}, ops{0}, cancel{0}, destruction{0};
 };
 
-template <class C> test_results do_benchmark(size_t handles)
+template <class C, class... Args> test_results do_benchmark(int handles, Args &&... args)
 {
+  const bool doing_warm_up = (handles < 0);
+  handles = abs(handles);
   auto create1 = std::chrono::high_resolution_clock::now();
-  auto ios = C(handles);
+  auto ios = C(handles, std::forward<Args>(args)...);
   auto create2 = std::chrono::high_resolution_clock::now();
   std::vector<std::thread> threads;
   std::atomic<size_t> done(THREADS + 1);
@@ -87,7 +133,7 @@ template <class C> test_results do_benchmark(size_t handles)
       ios.read();
     }
     ops2 = std::chrono::high_resolution_clock::now();
-    if(!done && std::chrono::duration_cast<std::chrono::seconds>(ops2 - ops1).count() >= BENCHMARK_DURATION)
+    if(!done && std::chrono::duration_cast<std::chrono::seconds>(ops2 - ops1).count() >= (doing_warm_up ? 3U : BENCHMARK_DURATION))
     {
       done = 1;
     }
@@ -110,11 +156,44 @@ template <class C> test_results do_benchmark(size_t handles)
   return ret;
 }
 
-template <class C> void benchmark(llfio::path_view csv, size_t max_handles)
+template <class C, class... Args> void benchmark(llfio::path_view csv, size_t max_handles, Args &&... args)
 {
-  auto res = do_benchmark<C>(1);
-  std::cout << "creation = " << res.creation << "\n     ops = " << res.ops
-          << "\n  cancel = " << res.cancel << "\n destroy = " << res.destruction << std::endl;
+  std::vector<test_results> results;
+  for(int n = 1; n <= max_handles; n <<= 2)
+  {
+    std::cout << "Benchmarking " << C::description() << " with " << n << " handles ..." << std::endl;
+    auto res = do_benchmark<C>(n, std::forward<Args>(args)...);
+    res.handles = n;
+    results.push_back(res);
+    std::cout << "   creates " << res.creation << " reads " << res.ops << " cancels " << res.cancel << " destroys " << res.destruction << std::endl;
+  }
+  std::ofstream of(csv.path());
+  of << "Handles";
+  for(auto &i : results)
+  {
+    of << "," << i.handles;
+  }
+  of << "\nCreates";
+  for(auto &i : results)
+  {
+    of << "," << i.creation;
+  }
+  of << "\nReads";
+  for(auto &i : results)
+  {
+    of << "," << i.ops;
+  }
+  of << "\nCancels";
+  for(auto &i : results)
+  {
+    of << "," << i.cancel;
+  }
+  of << "\nDestroys";
+  for(auto &i : results)
+  {
+    of << "," << i.destruction;
+  }
+  of << "\n";
 }
 
 template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
@@ -134,7 +213,7 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
   {
     read_state *state;
     inline void set_value(io_result<buffers_type> &&res);
-    void set_done() {}
+    inline void set_done();
   };
   using state_type = llfio::io_operation_connection<llfio::async_read, receiver_type>;
 
@@ -143,8 +222,8 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
     llfio::byte raw_buffer[1];
     buffer_type buffer;
     HandleType read_handle;
-    llfio::optional<state_type> op_state;
-    size_t ops{0};
+    size_t ops{0}, idx{0};
+    llfio::optional<state_type> op_states[2];
 
     explicit read_state(HandleType &&h)
         : read_handle(std::move(h))
@@ -153,8 +232,16 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
     void begin_io()
     {
       buffer = {raw_buffer, 1};
-      op_state.emplace(connect(llfio::async_read(read_handle, {{buffer}, 0}), receiver_type{this}));
-      op_state->start();
+      if(!op_states[idx])
+      {
+        op_states[idx].emplace(connect(llfio::async_read(read_handle, {{buffer}, 0}), receiver_type{this}));
+      }
+      else
+      {
+        op_states[idx]->reset();
+      }
+      op_states[idx]->start();
+      idx = !idx;
     }
   };
 
@@ -162,9 +249,22 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
   std::vector<HandleType> write_handles;
   std::vector<read_state> read_states;
 
-  explicit benchmark_llfio(size_t count)
+  static const char *description() noexcept
   {
-    multiplexer = llfio::io_multiplexer::best_available(ReaderThreads).value();
+#ifdef _MSC_VER
+    return typeid(HandleType).name();
+#else
+    static const char *v = [] {
+      size_t length = 0;
+      int status = 0;
+      return abi::__cxa_demangle(typeid(HandleType).name(), nullptr, &length, &status);
+    }();
+#endif
+  }
+
+  explicit benchmark_llfio(size_t count, std::unique_ptr<llfio::io_multiplexer> (*make_multiplexer)())
+  {
+    multiplexer = make_multiplexer();
     read_states.reserve(count);
     write_handles.reserve(count);
     // Construct read and write sides of the pipes
@@ -184,12 +284,13 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
   }
   void read()
   {
-    // Complete any i/o which has finished. The receiver will
-    // post restart of i/o on their handle to the multiplexer.
-    multiplexer->complete_io().value();
-
-    // Restart i/o for the stuff which completed.
-    multiplexer->invoke_posted_items().value();
+    // Complete any i/o which has finished.
+    if(0 == multiplexer->complete_io().value())
+    {
+      int a = 1;
+      // abort();
+      // std::this_thread::yield();
+    }
   }
   void write(unsigned which)
   {
@@ -197,15 +298,13 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
     const_buffer_type b(&c, 1);
     write_handles[which].write({{b}, 0}).value();
   }
-  void cancel() {
-    do
+  void cancel()
+  {
+    for(auto &i : read_states)
     {
-      for(auto &i : read_states)
-      {
-        i.op_state.reset();
-      }
-      multiplexer->complete_io().value();
-    } while(multiplexer->invoke_posted_items().value() > 0);
+      i.op_states[0].reset();
+      i.op_states[1].reset();
+    }
   }
   size_t destroy()
   {
@@ -228,13 +327,138 @@ template <class HandleType, size_t ReaderThreads> inline void benchmark_llfio<Ha
     std::cerr << res.error().message() << std::endl;
     abort();
   }
-  // If the i/o completed immediately, we would recurse to infinity, so defer until later (see read())
-  state->read_handle.multiplexer()->post([state = this->state]() { state->begin_io(); }).value();
+  // Restart the i/o for this handle
+  state->begin_io();
 }
+template <class HandleType, size_t ReaderThreads> inline void benchmark_llfio<HandleType, ReaderThreads>::receiver_type::set_done() {}
 
+#if ENABLE_ASIO
+template <size_t ReaderThreads> struct benchmark_asio_pipe
+{
+#ifdef _WIN32
+  using handle_type = asio::windows::stream_handle;
+#else
+  using handle_type = asio::posix::stream_descriptor;
+#endif
+
+  struct read_state
+  {
+    char raw_buffer[1];
+    handle_type read_handle;
+    size_t ops{0};
+
+    explicit read_state(handle_type &&h)
+        : read_handle(std::move(h))
+    {
+    }
+    void begin_io()
+    {
+      read_handle.async_read_some(asio::buffer(raw_buffer, 1), [this](const auto & /*unused*/, const auto & /*unused*/) {
+        ++ops;
+        begin_io();
+      });
+    }
+  };
+
+  llfio::optional<asio::io_context> multiplexer;
+  std::vector<handle_type> write_handles;
+  std::vector<read_state> read_states;
+
+  static const char *description() noexcept
+  {
+#ifdef _MSC_VER
+    return typeid(benchmark_asio_pipe).name();
+#else
+    static const char *v = [] {
+      size_t length = 0;
+      int status = 0;
+      return abi::__cxa_demangle(typeid(benchmark_asio_pipe).name(), nullptr, &length, &status);
+    }();
+#endif
+  }
+
+  explicit benchmark_asio_pipe(size_t count)
+  {
+    multiplexer.emplace((int) ReaderThreads);
+    read_states.reserve(count);
+    write_handles.reserve(count);
+    // Construct read and write sides of the pipes
+    llfio::filesystem::path::value_type name[64] = {'l', 'l', 'f', 'i', 'o', '_'};
+    for(size_t n = 0; n < count; n++)
+    {
+      using mode = typename llfio::pipe_handle::mode;
+      using creation = typename llfio::pipe_handle::creation;
+      using caching = typename llfio::pipe_handle::caching;
+      using flag = typename llfio::pipe_handle::flag;
+
+      name[QUICKCPPLIB_NAMESPACE::algorithm::string::to_hex_string(name + 6, 58, (const char *) &n, sizeof(n))] = 0;
+      auto read_handle = llfio::construct<llfio::pipe_handle>{name, mode::read, creation::if_needed, caching::all, flag::multiplexable}().value();
+      auto write_handle = llfio::construct<llfio::pipe_handle>{name, mode::write, creation::open_existing, caching::all, flag::multiplexable}().value();
+#ifdef _WIN32
+      read_states.emplace_back(handle_type(*multiplexer, read_handle.release().h));
+      write_handles.emplace_back(handle_type(*multiplexer, write_handle.release().h));
+#else
+      read_states.emplace_back(handle_type(*multiplexer, read_handle.release().fd));
+      write_handles.emplace_back(handle_type(*multiplexer, write_handle.release().fd));
+#endif
+    }
+    // Begin the read i/o for all pipes
+    for(auto &s : read_states)
+    {
+      s.begin_io();
+    }
+  }
+  void read()
+  {
+    // io_context::poll() does not return so long as there is completed i/o,
+    // which isn't what I want. I also don't want it to block if there is
+    // no pending i/o. The closest match is poll_one() I think. Internally,
+    // ASIO's poll() is implemented using poll_one() in any case.
+    multiplexer->poll_one();
+  }
+  void write(unsigned which)
+  {
+    char c = 78;
+    write_handles[which].write_some(asio::buffer(&c, 1));
+  }
+  void cancel()
+  {
+    for(auto &i : read_states)
+    {
+      i.read_handle.cancel();
+    }
+    multiplexer->poll();  // does not return until no completions are pending
+  }
+  size_t destroy()
+  {
+    write_handles.clear();
+    size_t ret = 0;
+    for(auto &i : read_states)
+    {
+      ret += i.ops;
+    }
+    read_states.clear();
+    multiplexer.reset();
+    return ret;
+  }
+};
+#endif
 
 int main(void)
 {
-  benchmark<benchmark_llfio<llfio::pipe_handle, 1>>("foo.csv", 1);
+  using make_multiplexer_type = std::unique_ptr<llfio::io_multiplexer> (*)();
+  static const make_multiplexer_type make_multiplexers[] = {
+#ifdef _WIN32
+  // +[]() -> std::unique_ptr<llfio::io_multiplexer> { return llfio::io_multiplexer::win_alertable().value(); }  //,
+  +[]() -> std::unique_ptr<llfio::io_multiplexer> { return llfio::io_multiplexer::win_iocp(1).value(); }
+#endif
+  };
+  std::cout << "Warming up ..." << std::endl;
+  do_benchmark<benchmark_llfio<llfio::pipe_handle, 1>>(-1, make_multiplexers[0]);
+
+  benchmark<benchmark_llfio<llfio::pipe_handle, 1>>("llfio-pipe-handle-1-readers.csv", 1, make_multiplexers[0]);
+#if ENABLE_ASIO
+  benchmark<benchmark_asio_pipe<1>>("asio-pipe-handle-1-readers.csv", 1);
+#endif
   return 0;
 }
