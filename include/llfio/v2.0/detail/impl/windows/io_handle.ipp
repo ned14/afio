@@ -60,18 +60,20 @@ template <class BuffersType> inline bool do_cancel(const native_handle_type &nat
 }
 
 template <bool blocking, class Syscall, class BuffersType>
-inline io_handle::io_result<BuffersType> do_read_write(size_t &scheduled, Syscall &&syscall, const native_handle_type &nativeh, windows_nt_kernel::PIO_APC_ROUTINE routine, detail::io_operation_connection *op, span<typename detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK> ols,
+inline bool do_read_write(io_handle::io_result<BuffersType> &ret, size_t &scheduled, Syscall &&syscall, const native_handle_type &nativeh, windows_nt_kernel::PIO_APC_ROUTINE routine, detail::io_operation_connection *op, span<typename detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK> ols,
                                                        io_handle::io_request<BuffersType> reqs, deadline d) noexcept
 {
   using namespace windows_nt_kernel;
   using EIOSB = typename detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK;
   if(d && !nativeh.is_nonblocking())
   {
-    return errc::not_supported;
+    ret=errc::not_supported;
+    return true;
   }
   if(reqs.buffers.size() > 64)
   {
-    return errc::argument_list_too_long;
+    ret=errc::argument_list_too_long;
+    return true;
   }
   LLFIO_WIN_DEADLINE_TO_SLEEP_INIT(d);
   ols = span<EIOSB>(ols.data(), reqs.buffers.size());
@@ -123,7 +125,8 @@ inline io_handle::io_result<BuffersType> do_read_write(size_t &scheduled, Syscal
     if(ntstat < 0 && ntstat != 0x103 /*STATUS_PENDING*/)
     {
       InterlockedCompareExchange(&ol.Status, ntstat, 0x103 /*STATUS_PENDING*/);
-      return ntkernel_error(ntstat);
+      ret=ntkernel_error(ntstat);
+      return true;
     }
     ++scheduled;
   }
@@ -137,7 +140,15 @@ inline io_handle::io_result<BuffersType> do_read_write(size_t &scheduled, Syscal
       if(STATUS_TIMEOUT == ntwait(nativeh.h, (IO_STATUS_BLOCK &) ol, nd))
       {
         // ntwait cancels the i/o, undoer will cancel all the other i/o
-        LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
+        auto r = [&]() -> result<void> {
+          LLFIO_WIN_DEADLINE_TO_TIMEOUT_LOOP(d);
+          return success();
+        }();
+        if(!r)
+        {
+          ret = r.error();
+          return true;
+        }
       }
     }
   }
@@ -149,25 +160,26 @@ inline io_handle::io_result<BuffersType> do_read_write(size_t &scheduled, Syscal
     {
       if(ols[n].Status == static_cast<ULONG_PTR>(0x103 /*STATUS_PENDING*/))
       {
-        return success();  // empty buffers means at least one buffer is not completed yet
+        return false;  // at least one buffer is not completed yet
       }
     }
   }
-  auto ret(reqs.buffers);
+  ret = {reqs.buffers.data(), 0};
   for(size_t n = 0; n < reqs.buffers.size(); n++)
   {
     assert(ols[n].Status != -1);
-    if(ols[n].Status != 0)
+    if(ols[n].Status < 0)
     {
-      return ntkernel_error(static_cast<NTSTATUS>(ols[n].Status));
+      ret= ntkernel_error(static_cast<NTSTATUS>(ols[n].Status));
+      return true;
     }
     reqs.buffers[n] = {reqs.buffers[n].data(), ols[n].Information};
     if(reqs.buffers[n].size() != 0)
     {
-      ret = {ret.data(), n + 1};
+      ret = {reqs.buffers.data(), n + 1};
     }
   }
-  return io_handle::io_result<BuffersType>(std::move(ret));
+  return true;
 }
 
 io_handle::io_result<io_handle::buffers_type> io_handle::read(io_handle::io_request<io_handle::buffers_type> reqs, deadline d) noexcept
@@ -177,8 +189,10 @@ io_handle::io_result<io_handle::buffers_type> io_handle::read(io_handle::io_requ
   LLFIO_LOG_FUNCTION_CALL(this);
   using EIOSB = typename detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK;
   std::array<EIOSB, 64> _ols{};
+  io_handle::io_result<io_handle::buffers_type> ret(reqs.buffers);
   size_t scheduled = 0;
-  return do_read_write<true>(scheduled, NtReadFile, _v, nullptr, nullptr, {_ols.data(), _ols.size()}, reqs, d);
+  do_read_write<true>(ret, scheduled, NtReadFile, _v, nullptr, nullptr, {_ols.data(), _ols.size()}, reqs, d);
+  return ret;
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::io_request<io_handle::const_buffers_type> reqs, deadline d) noexcept
@@ -188,8 +202,10 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::write(io_handle::
   LLFIO_LOG_FUNCTION_CALL(this);
   using EIOSB = typename detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK;
   std::array<EIOSB, 64> _ols{};
+  io_handle::io_result<io_handle::const_buffers_type> ret(reqs.buffers);
   size_t scheduled = 0;
-  return do_read_write<true>(scheduled, NtWriteFile, _v, nullptr, nullptr, {_ols.data(), _ols.size()}, reqs, d);
+  do_read_write<true>(ret, scheduled, NtWriteFile, _v, nullptr, nullptr, {_ols.data(), _ols.size()}, reqs, d);
+  return ret;
 }
 
 io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle::io_request<io_handle::const_buffers_type> reqs, barrier_kind kind, deadline d) noexcept
@@ -234,6 +250,7 @@ io_handle::io_result<io_handle::const_buffers_type> io_handle::barrier(io_handle
 
 struct apc_completion_routine
 {
+#pragma optimize("", off)
   static void __stdcall thunk(void *ApcContext, detail::io_operation_connection::_EXTENDED_IO_STATUS_BLOCK *IoStatusBlock, unsigned long /*unused*/)
   {
     // The context is the i/o state
@@ -241,6 +258,7 @@ struct apc_completion_routine
     // Add this to the completed list
     op->h->multiplexer()->_os_has_completed_io(op);
   }
+#pragma optimize("", on)
 };
 
 void io_handle::_apc_begin(_async_op what, detail::io_operation_connection *op, void *_reqs) noexcept
@@ -248,13 +266,6 @@ void io_handle::_apc_begin(_async_op what, detail::io_operation_connection *op, 
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
   LLFIO_LOG_FUNCTION_CALL(this);
-  auto *reqs = (io_request<buffers_type> *) _reqs;
-  if(reqs->buffers.empty())
-  {
-    // The i/o completed immediately with success
-    op->_complete_io(result<size_t>(0));
-    return;
-  }
   size_t scheduled = 0;
   switch(what)
   {
@@ -262,23 +273,23 @@ void io_handle::_apc_begin(_async_op what, detail::io_operation_connection *op, 
     abort();
   case _async_op::read:
   {
-    auto r = do_read_write<false>(scheduled, NtReadFile, _v, (PIO_APC_ROUTINE) apc_completion_routine::thunk, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline());
-    if(!r || !r.value().empty())
+    auto *reqs = (io_request<buffers_type> *) _reqs;
+    io_handle::io_result<io_handle::buffers_type> ret(reqs->buffers);
+    if(do_read_write<false>(ret, scheduled, NtReadFile, _v, (PIO_APC_ROUTINE) apc_completion_routine::thunk, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline()))
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
-      return;
     }
     break;
   }
   case _async_op::write:
   {
-    auto r = do_read_write<false>(scheduled, NtWriteFile, _v, (PIO_APC_ROUTINE) apc_completion_routine::thunk, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline());
-    if(!r || !r.value().empty())
+    auto *reqs = (io_request<const_buffers_type> *) _reqs;
+    io_handle::io_result<io_handle::const_buffers_type> ret(reqs->buffers);
+    if(do_read_write<false>(ret, scheduled, NtWriteFile, _v, (PIO_APC_ROUTINE) apc_completion_routine::thunk, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline()))
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
-      return;
     }
     break;
   }
@@ -308,6 +319,7 @@ void io_handle::_apc_begin(_async_op what, detail::io_operation_connection *op, 
   {
     // The implementation will scan the status blocks and report the failure
     op->_complete_io(result<size_t>(0));
+    op->cancel();  // won't cancel a completed i/o, does call set_done()
     return;
   }
   // Add this scheduled i/o to the multiplexer
@@ -324,13 +336,9 @@ void io_handle::_iocp_begin(_async_op what, detail::io_operation_connection *op,
   windows_nt_kernel::init();
   using namespace windows_nt_kernel;
   LLFIO_LOG_FUNCTION_CALL(this);
-  auto *reqs = (io_request<buffers_type> *) _reqs;
-  if(reqs->buffers.empty())
-  {
-    // The i/o completed immediately with success
-    op->_complete_io(result<size_t>(0));
-    return;
-  }
+#ifdef LLFIO_DEBUG_PRINT
+  std::cerr << "_iocp_begin " << op << std::endl;
+#endif
   size_t scheduled = 0;
   switch(what)
   {
@@ -338,23 +346,23 @@ void io_handle::_iocp_begin(_async_op what, detail::io_operation_connection *op,
     abort();
   case _async_op::read:
   {
-    auto r = do_read_write<false>(scheduled, NtReadFile, _v, nullptr /*for IOCP must be null*/, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline());
-    if(!r || !r.value().empty())
+    auto *reqs = (io_request<buffers_type> *) _reqs;
+    io_handle::io_result<io_handle::buffers_type> ret(reqs->buffers);
+    if(do_read_write<false>(ret, scheduled, NtReadFile, _v, nullptr /*for IOCP must be null*/, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline()))
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
-      return;
     }
     break;
   }
   case _async_op::write:
   {
-    auto r = do_read_write<false>(scheduled, NtWriteFile, _v, nullptr /*for IOCP must be null*/, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline());
-    if(!r || !r.value().empty())
+    auto *reqs = (io_request<const_buffers_type> *) _reqs;
+    io_handle::io_result<io_handle::const_buffers_type> ret(reqs->buffers);
+    if(do_read_write<false>(ret, scheduled, NtWriteFile, _v, nullptr /*for IOCP must be null*/, op, {&op->ols[0], op->max_overlappeds}, *reqs, deadline()))
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
-      return;
     }
     break;
   }
@@ -384,12 +392,13 @@ void io_handle::_iocp_begin(_async_op what, detail::io_operation_connection *op,
   {
     // The implementation will scan the status blocks and report the failure
     op->_complete_io(result<size_t>(0));
+    op->cancel();  // won't cancel a completed i/o, does call set_done()
     return;
   }
   // Add this scheduled i/o to the multiplexer
   multiplexer()->_scheduled_io(op);
 }
-void io_handle::_iocp_cancel(detail::io_operation_connection *op, void * _reqs) noexcept
+void io_handle::_iocp_cancel(detail::io_operation_connection *op, void *_reqs) noexcept
 {
   LLFIO_LOG_FUNCTION_CALL(this);
   auto *reqs = (io_request<buffers_type> *) _reqs;

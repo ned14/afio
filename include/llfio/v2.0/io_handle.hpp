@@ -141,7 +141,8 @@ public:
       OUTCOME_TRY(type, c->_register_io_handle(this));
 #ifdef _WIN32
       this->_multiplexer_is_apc = (type == 0);
-      this->_multiplexer_is_iocp = (type == 1);
+      this->_multiplexer_is_iocp = (type == 1 || type == 2);
+      this->_multiplexer_is_iocp_avoiding = (type == 2);
 #endif
     }
     this->_ctx = c;

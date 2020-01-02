@@ -25,6 +25,8 @@ Distributed under the Boost Software License, Version 1.0.
 #ifndef LLFIO_IO_MULTIPLEXER_H
 #define LLFIO_IO_MULTIPLEXER_H
 
+//#define LLFIO_DEBUG_PRINT
+
 #include "handle.hpp"
 
 #ifdef _MSC_VER
@@ -612,9 +614,14 @@ namespace this_thread
   struct LLFIO_DECL delay_invoking_io_completion
   {
     static void add(detail::io_operation_connection *op);
+    static void remove(detail::io_operation_connection *op);
 
-    LLFIO_HEADERS_ONLY_MEMFUNC_SPEC delay_invoking_io_completion();
+    LLFIO_HEADERS_ONLY_MEMFUNC_SPEC delay_invoking_io_completion(int &count);
     LLFIO_HEADERS_ONLY_MEMFUNC_SPEC ~delay_invoking_io_completion();
+
+  private:
+    int &_count;
+    delay_invoking_io_completion *_prev{nullptr};
   };
 }  // namespace this_thread
 
@@ -639,7 +646,7 @@ namespace detail
     // Used in doubly linked lists for scheduled and OS completed
     io_operation_connection *prev{nullptr}, *next{nullptr};
     // Used in singlely linked list for non-recursive completion invocations
-    io_operation_connection *delay_invoking_next{nullptr};
+    io_operation_connection *delay_invoking_prev{nullptr}, *delay_invoking_next{nullptr};
     // Set at start for duration timed out i/o
     std::chrono::steady_clock::time_point deadline_duration;
     handle *h{nullptr};
@@ -647,11 +654,11 @@ namespace detail
     // args to op and internal metadata
     deadline d;
     io_multiplexer::barrier_kind barrierkind{io_multiplexer::barrier_kind::wait_all};
-    bool is_scheduled{false};               // whether state is scheduled
-    bool is_added_to_deadline_list{false};  // whether state needs to be removed from ordered deadline lists
-    bool is_os_completed{false};            // whether the OS kernel is done with this state but Receiver::set_value() has not yet been called
-    bool is_done_set{false};                // whether Receiver::set_done() been called
-    bool is_being_destructed{false};        // whether i/o is being cancelled due to state destruction, in which case don't call Receiver::set_value()
+    bool is_scheduled{false};                   // whether state is scheduled
+    signed char is_added_to_deadline_list{-1};  // =1 if state needs to be removed from ordered deadline lists
+    bool is_os_completed{false};                // whether the OS kernel is done with this state but Receiver::set_value() has not yet been called
+    bool is_done_set{false};                    // whether Receiver::set_done() been called
+    bool is_being_destructed{false};            // whether i/o is being cancelled due to state destruction, in which case don't call Receiver::set_value()
 
 #ifdef _WIN32
 #ifdef _MSC_VER
@@ -877,6 +884,10 @@ namespace detail
           auto internal = ols[n].Status;
           if(internal != 0)
           {
+            if(internal == 0x103 /*STATUS_PENDING*/)
+            {
+              abort();
+            }
             storage.req.~request_type();
             new(&storage.ret) result_type(ntkernel_error_from_overlapped(internal));
             status.store(status_type::completed, std::memory_order_release);
@@ -1130,6 +1141,9 @@ protected:
     {
       // Set success or failure
       sender_type::_create_result(std::move(bytes_transferred));
+#ifdef LLFIO_DEBUG_PRINT
+      std::cerr << "_complete_io " << this << std::endl;
+#endif
       _receiver.set_value(std::move(this->storage.ret));
     }
     else
@@ -1263,10 +1277,14 @@ public:
     }
     // Set done. NOTE that set_done() may legally destruct the state!
     this->is_done_set = true;
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "set_done " << this << std::endl;
+#endif
     _receiver.set_done();
   }
   //! Reset the operation back to a connected state
-  void reset() noexcept {
+  void reset() noexcept
+  {
     if(this->status.load(std::memory_order_acquire) != _status_type::completed || !this->is_done_set)
     {
       abort();
@@ -1281,8 +1299,10 @@ public:
 protected:
   virtual _status_type _poll(_poll_kind caller) noexcept override final
   {
-    // std::cerr << "_poll " << this << std::endl;
     _status_type ret = this->status.load(std::memory_order_acquire);
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "_poll " << this << " (status=" << (int) ret << ")" << std::endl;
+#endif
     if(ret == _status_type::scheduled)
     {
       _lock_guard g(this->lock);

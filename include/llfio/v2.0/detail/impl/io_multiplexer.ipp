@@ -45,16 +45,40 @@ namespace this_thread
   static LLFIO_THREAD_LOCAL struct delay_invoking_io_completion_state
   {
     detail::io_operation_connection *begin{nullptr}, *end{nullptr};
-    int count{0};
+    delay_invoking_io_completion *current_raii{nullptr};
+    int *count{nullptr}, nesting{0};
+
+    void drain()
+    {
+      detail::io_operation_connection *_begin = begin;
+      begin = nullptr;
+      end = nullptr;
+      int c = 0;
+      while(_begin != nullptr)
+      {
+        auto *op = _begin;
+        _begin = _begin->delay_invoking_next;
+        op->_complete_io(result<size_t>(0));
+        op->delay_invoking_next = op->delay_invoking_prev = nullptr;
+        ++c;
+      }
+      *count += c;
+    }
   } _delay_invoking_io_completion_state;
   void delay_invoking_io_completion::add(detail::io_operation_connection *op)
   {
-    if(_delay_invoking_io_completion_state.count == 0)
+    if(_delay_invoking_io_completion_state.nesting == 0)
     {
       op->_complete_io(result<size_t>(0));
       return;
     }
-    op->next = nullptr;
+    if(op->delay_invoking_next != nullptr || op->delay_invoking_prev != nullptr)
+    {
+      abort();
+    }
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "delay_invoking_io_completion::add " << op << std::endl;
+#endif
     if(_delay_invoking_io_completion_state.begin == nullptr)
     {
       _delay_invoking_io_completion_state.begin = op;
@@ -62,19 +86,64 @@ namespace this_thread
       return;
     }
     _delay_invoking_io_completion_state.end->delay_invoking_next = op;
+    op->delay_invoking_prev = _delay_invoking_io_completion_state.end;
+    _delay_invoking_io_completion_state.end = op;
   }
-  delay_invoking_io_completion::delay_invoking_io_completion() { ++_delay_invoking_io_completion_state.count; }
+  void delay_invoking_io_completion::remove(detail::io_operation_connection *op)
+  {
+    if(op->delay_invoking_next == nullptr && op->delay_invoking_prev == nullptr && _delay_invoking_io_completion_state.begin!=op)
+    {
+      return;
+    }
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "delay_invoking_io_completion::remove " << op << std::endl;
+#endif
+    if(op->delay_invoking_next == nullptr)
+    {
+      _delay_invoking_io_completion_state.end = op->delay_invoking_prev;
+    }
+    else
+    {
+      op->delay_invoking_next->delay_invoking_prev = op->delay_invoking_prev;
+    }
+    if(op->delay_invoking_prev == nullptr)
+    {
+      _delay_invoking_io_completion_state.begin = op->delay_invoking_next;
+    }
+    else
+    {
+      op->delay_invoking_prev->delay_invoking_next = op->delay_invoking_next;
+    }
+    op->delay_invoking_next = op->delay_invoking_prev = nullptr;
+  }
+  delay_invoking_io_completion::delay_invoking_io_completion(int &count)
+      : _count(count)
+      , _prev(_delay_invoking_io_completion_state.current_raii)
+  {
+    _delay_invoking_io_completion_state.count = &count;
+    if(++_delay_invoking_io_completion_state.nesting == 1)
+    {
+      //_delay_invoking_io_completion_state.drain();
+    }
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "delay_invoking_io_completion nesting = " << _delay_invoking_io_completion_state.nesting << std::endl;
+#endif
+  }
   delay_invoking_io_completion::~delay_invoking_io_completion()
   {
-    if(--_delay_invoking_io_completion_state.count)
+    if(_delay_invoking_io_completion_state.nesting == 1)
     {
-      detail::io_operation_connection *op;
-      while((op = _delay_invoking_io_completion_state.begin) != nullptr)
-      {
-        _delay_invoking_io_completion_state.begin = op->delay_invoking_next;
-        op->_complete_io(result<size_t>(0));
-      }
+#ifdef LLFIO_DEBUG_PRINT
+      std::cerr << "~delay_invoking_io_completion drain" << std::endl;
+#endif
+      _delay_invoking_io_completion_state.drain();
     }
+    --_delay_invoking_io_completion_state.nesting;
+    _delay_invoking_io_completion_state.current_raii = _prev;
+    _delay_invoking_io_completion_state.count = (_prev != nullptr) ? &_prev->_count : nullptr;
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "~delay_invoking_io_completion nesting = " << _delay_invoking_io_completion_state.nesting << std::endl;
+#endif
   }
 }  // namespace this_thread
 

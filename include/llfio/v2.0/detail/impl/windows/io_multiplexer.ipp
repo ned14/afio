@@ -72,7 +72,7 @@ protected:
     try
     {
       span<detail::io_operation_connection *> out(in.data(), (size_t) 0);
-      for(auto *i = _scheduled_end; i != nullptr && !i->is_added_to_deadline_list; i = i->prev)
+      for(auto *i = _scheduled_end; i != nullptr && -1 == i->is_added_to_deadline_list; i = i->prev)
       {
         if(i->deadline_duration != std::chrono::steady_clock::time_point())
         {
@@ -81,16 +81,21 @@ protected:
           {
             need_to_wake_all = true;
           }
+          i->is_added_to_deadline_list = 1;
         }
-        else
+        else if(i->d)
         {
           auto it = _absolutes.insert({i->d.to_time_point(), i});
           if(it == _absolutes.begin())
           {
             need_to_wake_all = true;
           }
+          i->is_added_to_deadline_list = 1;
         }
-        i->is_added_to_deadline_list = true;
+        else
+        {
+          i->is_added_to_deadline_list = 0;
+        }
       }
 
       // Process timed out pending operations, shortening the requested timeout if necessary
@@ -189,7 +194,6 @@ protected:
 
   void _add_to_scheduled(detail::io_operation_connection *op, bool tofront = false) noexcept
   {
-    assert(op->d);
     assert(!op->is_scheduled);
     if(tofront)
     {
@@ -223,7 +227,6 @@ protected:
   }
   void _remove_from_scheduled(detail::io_operation_connection *op) noexcept
   {
-    assert(op->d);
     assert(op->is_scheduled);
     if(op->prev == nullptr)
     {
@@ -282,7 +285,7 @@ protected:
   }
   void _remove_from_deadline_list(detail::io_operation_connection *op) noexcept
   {
-    if(op->is_added_to_deadline_list)
+    if(1 == op->is_added_to_deadline_list)
     {
       if(op->deadline_duration != std::chrono::steady_clock::time_point())
       {
@@ -331,7 +334,7 @@ protected:
           abort();
         }
       }
-      op->is_added_to_deadline_list = false;
+      op->is_added_to_deadline_list = (op->d) ? -1 : 0;
     }
   }
   void _reschedule_io(detail::io_operation_connection *op) noexcept
@@ -339,54 +342,44 @@ protected:
     // An unfinished i/o in the completed list is being put back into scheduled
     assert(op->is_os_completed);
     _remove_from_completed(op);
-    if(op->d)
-    {
-      // MUST add to front of list, else it breaks ordered list calculation
-      _add_to_scheduled(op, true);
-    }
-    op->is_scheduled = true;
+    // MUST add to front of list, else it breaks ordered list calculation
+    _add_to_scheduled(op, true);
   }
   virtual void _scheduled_io(detail::io_operation_connection *op) noexcept override final
   {
-    //std::cerr << "_scheduled_io " << op << std::endl;
+    // std::cerr << "_scheduled_io " << op << std::endl;
     assert(!op->is_scheduled);
-    // Add this state to the list of scheduled i/o if and only if it has a deadline
-    // Only at the point of wait will unseen pending i/o be merged into the
-    // ordered lists of expiring i/o
+    _lock_guard g(this->_lock);
+    _add_to_scheduled(op);
     if(op->d)
     {
-      _lock_guard g(this->_lock);
-      _add_to_scheduled(op);
-
       // FIXME On IOCP where we are threadsafe we need to wake any currently
       // idling thread to recalculate the global ordered timeout list
     }
-    op->is_scheduled = true;
   }
   virtual void _os_has_completed_io(detail::io_operation_connection *op) noexcept override final
   {
-    //std::cerr << "_os_has_completed_io " << op << " delayed_completion=" << op->is_scheduled << std::endl;
+    // std::cerr << "_os_has_completed_io " << op << " delayed_completion=" << op->is_scheduled << std::endl;
+    assert(op->is_scheduled);
     assert(!op->is_os_completed);
     _lock_guard g(this->_lock);
-    if(op->is_scheduled)
-    {
-      if(op->d)
-      {
-        _remove_from_scheduled(op);
-      }
-      op->is_scheduled = false;
-    }
+    _remove_from_scheduled(op);
     _add_to_completed(op);
   }
   void _done_io(detail::io_operation_connection *op, _lock_guard &g) noexcept
   {
-    //std::cerr << "_done_io " << op << std::endl;
-    //assert(op->is_os_completed);
+    // std::cerr << "_done_io " << op << std::endl;
+    assert(op->is_scheduled || op->is_os_completed);
+    assert(!(op->is_scheduled && op->is_os_completed));
     assert(!op->is_done_set);
     _remove_from_deadline_list(op);
     if(op->is_os_completed)
     {
       _remove_from_completed(op);
+    }
+    if(op->is_scheduled)
+    {
+      _remove_from_scheduled(op);
     }
     // Won't cancel a completed operation, but will call the Receiver's .set_done()
     g.unlock();
@@ -456,27 +449,30 @@ public:
     }
     LLFIO_DEADLINE_TO_SLEEP_INIT(d);
 
-    /* This will execute all APCs enqueued. If more are enqueued by the
-    execution of the APCs, this will block forever. Our APC routines
-    therefore simply call _completed_io(), which adds them to the
-    completed i/o list.
-    */
-    NTSTATUS ntstat = NtDelayExecution(1u, timeout);
-    if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
+    int count = 0;
+    this_thread::delay_invoking_io_completion invoker(count);
+    if(this->_scheduled_begin != nullptr)
     {
-      return ntkernel_error(ntstat);
+      /* This will execute all APCs enqueued. If new APCs are enqueued by the
+      execution of the APCs, this will block forever. Our APC routines
+      therefore simply call _completed_io(), which removes them from the
+      scheduled i/o list adding them to the completed i/o list, which we
+      process immediately afterwards.
+      */
+      NTSTATUS ntstat = NtDelayExecution(1u, timeout);
+      if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
+      {
+        return ntkernel_error(ntstat);
+      }
+      if(ntstat == STATUS_TIMEOUT)
+      {
+        return -1;
+      }
     }
-    if(ntstat == STATUS_TIMEOUT)
-    {
-      return -1;
-    }
-
     if(max_items < 0)
     {
       max_items = INT_MAX;
     }
-    int count = 0;
-    this_thread::delay_invoking_io_completion invoker;
     _lock_guard g(this->_lock);
     const auto *end = _completed_end;
     while(_completed_begin != nullptr && count++ < max_items)
@@ -485,6 +481,7 @@ public:
       const bool done_all = (begin == end);
       g.unlock();
       // See if all i/o requests are now complete, if so complete the op
+      invoker.remove(begin);
       if(begin->_poll(poll_kind::check) == io_state_status::completed)
       {
         g.lock();
@@ -508,7 +505,7 @@ public:
         }
       }
     }
-    return count;
+    return (count == 0 && (this->_scheduled_begin != nullptr || _completed_begin != nullptr)) ? -1 : count;
   }
 
   virtual result<int> complete_io(int max_items = -1, deadline d = deadline()) noexcept override final
@@ -640,6 +637,8 @@ public:
       return ntkernel_error(ntstat);
     }
     return 1;
+    // If this works, we can avoid IOCP entirely for immediately completing i/o
+    //    return !SetFileCompletionNotificationModes(h->native_handle().h, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE) ? 1 : 2;
   }
   virtual result<void> _deregister_io_handle(handle *h) noexcept override final
   {
@@ -669,50 +668,64 @@ public:
     windows_nt_kernel::init();
     using namespace windows_nt_kernel;
 
-    FILE_IO_COMPLETION_INFORMATION entries[64];
-    ULONG filled = 0;
-    if(max_items < 0)
-    {
-      max_items = INT_MAX;
-    }
-    if(max_items > (int) (sizeof(entries) / sizeof(entries[0])))
-    {
-      max_items = (int) (sizeof(entries) / sizeof(entries[0]));
-    }
-#if 1
-    NTSTATUS ntstat = NtRemoveIoCompletion(this->_v.h, &entries[0].KeyContext, &entries[0].ApcContext, &entries[0].IoStatusBlock, timeout);
-    filled = 1;
-#else
-    NTSTATUS ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, (unsigned) max_items, &filled, timeout, false);
-#endif
-    if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
-    {
-      return ntkernel_error(ntstat);
-    }
-    if(filled == 0 || ntstat == STATUS_TIMEOUT)
-    {
-      return -1;
-    }
+    // Delay i/o completions until destruction
     int count = 0;
-    this_thread::delay_invoking_io_completion invoker;
-    for(ULONG n = 0; n < filled; n++)
+    this_thread::delay_invoking_io_completion invoker(count);
+#ifdef LLFIO_DEBUG_PRINT
+    std::cerr << "_do_complete_io _scheduled_begin = " << this->_scheduled_begin << std::endl;
+    #endif
+    if(this->_scheduled_begin != nullptr)
     {
-      // The context is the i/o state
-      auto *op = (detail::io_operation_connection *) entries[n].ApcContext;
-      if(op == nullptr)
+      FILE_IO_COMPLETION_INFORMATION entries[64];
+      ULONG filled = 0;
+      if(max_items < 0)
       {
-        // post() poke
-        continue;
+        max_items = INT_MAX;
       }
-      // See if all i/o requests are now complete, if so complete the op
-      if(op->_poll(poll_kind::check) == io_state_status::completed)
+      if(max_items > (int) (sizeof(entries) / sizeof(entries[0])))
       {
-        _lock_guard g(this->_lock);
-        _done_io(op, g);
+        max_items = (int) (sizeof(entries) / sizeof(entries[0]));
       }
-      ++count;
+      NTSTATUS ntstat;
+      if(this->_scheduled_begin == this->_scheduled_end)
+      {
+        // NtRemoveIoCompletion is markedly quicker than NtRemoveIoCompletionEx,
+        // so if it is just a single scheduled op don't pay the extra cost
+        ntstat = NtRemoveIoCompletion(this->_v.h, &entries[0].KeyContext, &entries[0].ApcContext, &entries[0].IoStatusBlock, timeout);
+        filled = 1;
+      }
+      else
+      {
+        ntstat = NtRemoveIoCompletionEx(this->_v.h, entries, (unsigned) max_items, &filled, timeout, false);
+      }
+      if(ntstat < 0 && ntstat != STATUS_TIMEOUT)
+      {
+        return ntkernel_error(ntstat);
+      }
+      if(filled == 0 || ntstat == STATUS_TIMEOUT)
+      {
+        return -1;
+      }
+      for(ULONG n = 0; n < filled; n++)
+      {
+        // The context is the i/o state
+        auto *op = (detail::io_operation_connection *) entries[n].ApcContext;
+        if(op == nullptr)
+        {
+          // post() poke
+          continue;
+        }
+        // See if all i/o requests are now complete, if so complete the op
+        invoker.remove(op);
+        if(op->_poll(poll_kind::check) == io_state_status::completed)
+        {
+          _lock_guard g(this->_lock);
+          _done_io(op, g);
+        }
+        ++count;
+      }
     }
-    return count;
+    return (count == 0 && this->_scheduled_begin != nullptr) ? -1 : count;
   }
 
   virtual result<int> complete_io(int max_items = -1, deadline /*unused*/ = deadline()) noexcept override final

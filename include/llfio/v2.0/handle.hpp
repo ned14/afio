@@ -213,6 +213,7 @@ protected:
 #ifdef _WIN32
       uint8_t _multiplexer_is_apc : 1;
       uint8_t _multiplexer_is_iocp : 1;
+      uint8_t _multiplexer_is_iocp_avoiding : 1;
 #endif
     };
   };

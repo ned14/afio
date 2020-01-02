@@ -27,32 +27,31 @@ static constexpr int BENCHMARK_DURATION = 10;
 
 static constexpr size_t THREADS = 2;
 
-/* ASIO IOCP (uses shared ptrs to i/o state enabling early
-completion and late destruction):
+/* ASIO IOCP:
 
 Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
-   creates 12500 reads 205124 cancels 64516.1 destroys 66225.2
+   creates 14367.8 reads 199862 cancels 53475.9 destroys 57142.9
 
 Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
-   creates 11337.9 reads 202470 cancels 69444.4 destroys 68027.2
+   creates 15873 reads 205075 cancels 57142.9 destroys 63291.1
 
 Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
-   creates 17921.1 reads 208869 cancels 58479.5 destroys 68027.2
+   creates 14513.8 reads 201082 cancels 58823.5 destroys 58823.5
 
 
-LLFIO IOCP (NtRemoveIoCompletion executes state release):
-
-Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
-   creates 27173.9 reads 182966 cancels 303030 destroys 44052.9
+LLFIO IOCP:
 
 Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
-   creates 23041.5 reads 180083 cancels 285714 destroys 51813.5
+   creates 22421.5 reads 200027 cancels 303030 destroys 50761.4
 
 Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
-   creates 23201.9 reads 179958 cancels 256410 destroys 49019.6
+   creates 20876.8 reads 199098 cancels 3.33333e+06 destroys 40816.3
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 25252.5 reads 194343 cancels 285714 destroys 42553.2
 
 
-LLFIO Alertable (APCs enqueue state release):
+LLFIO Alertable:
 
 Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
    creates 23640.7 reads 111594 cancels 434783 destroys 9794.32
@@ -223,7 +222,7 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
     buffer_type buffer;
     HandleType read_handle;
     size_t ops{0}, idx{0};
-    llfio::optional<state_type> op_states[2];
+    llfio::optional<state_type> op_states[4];
 
     explicit read_state(HandleType &&h)
         : read_handle(std::move(h))
@@ -241,7 +240,10 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
         op_states[idx]->reset();
       }
       op_states[idx]->start();
-      idx = !idx;
+      if(++idx == sizeof(op_states) / sizeof(op_states[0]))
+      {
+        idx = 0;
+      }
     }
   };
 
@@ -308,13 +310,13 @@ template <class HandleType, size_t ReaderThreads> struct benchmark_llfio
   }
   size_t destroy()
   {
-    write_handles.clear();
     size_t ret = 0;
     for(auto &i : read_states)
     {
       ret += i.ops;
     }
     read_states.clear();
+    write_handles.clear();
     multiplexer.reset();
     return ret;
   }
@@ -330,7 +332,8 @@ template <class HandleType, size_t ReaderThreads> inline void benchmark_llfio<Ha
   // Restart the i/o for this handle
   state->begin_io();
 }
-template <class HandleType, size_t ReaderThreads> inline void benchmark_llfio<HandleType, ReaderThreads>::receiver_type::set_done() {}
+template <class HandleType, size_t ReaderThreads> inline void benchmark_llfio<HandleType, ReaderThreads>::receiver_type::set_done() {
+}
 
 #if ENABLE_ASIO
 template <size_t ReaderThreads> struct benchmark_asio_pipe
