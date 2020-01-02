@@ -352,6 +352,12 @@ void io_handle::_iocp_begin(_async_op what, detail::io_operation_connection *op,
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
+      if(_multiplexer_is_iocp_avoiding && !ret.has_error())
+      {
+        // Immediately successful i/o does not queue IOCP, so don't schedule this op
+        op->is_immediately_done_after_completion = true;
+        return;
+      }
     }
     break;
   }
@@ -363,6 +369,12 @@ void io_handle::_iocp_begin(_async_op what, detail::io_operation_connection *op,
     {
       // If the i/o completed immediately, complete it either now or at base of stack
       this_thread::delay_invoking_io_completion::add(op);
+      if(_multiplexer_is_iocp_avoiding && !ret.has_error())
+      {
+        // Immediately successful i/o does not queue IOCP, so don't schedule this op
+        op->is_immediately_done_after_completion = true;
+        return;
+      }
     }
     break;
   }

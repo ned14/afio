@@ -659,6 +659,7 @@ namespace detail
     bool is_os_completed{false};                // whether the OS kernel is done with this state but Receiver::set_value() has not yet been called
     bool is_done_set{false};                    // whether Receiver::set_done() been called
     bool is_being_destructed{false};            // whether i/o is being cancelled due to state destruction, in which case don't call Receiver::set_value()
+    bool is_immediately_done_after_completion{false}; // whether to call Receiver::set_done() immediately after Receiver::set_value()
 
 #ifdef _WIN32
 #ifdef _MSC_VER
@@ -1145,6 +1146,11 @@ protected:
       std::cerr << "_complete_io " << this << std::endl;
 #endif
       _receiver.set_value(std::move(this->storage.ret));
+      if(this->is_immediately_done_after_completion)
+      {
+        this->is_done_set = true;
+        _receiver.set_done();
+      }
     }
     else
     {
@@ -1250,6 +1256,11 @@ public:
     {
       abort();
     }
+    if(this->is_being_destructed)
+    {
+      cancel();
+      return;
+    }
     // If this i/o is timed, begin the timeout from now
     if(this->d)
     {
@@ -1290,6 +1301,7 @@ public:
       abort();
     }
     this->is_done_set = false;
+    this->is_immediately_done_after_completion = false;
     this->status.store(_status_type::unscheduled, std::memory_order_release);
   }
   /*! \brief Poll the operation, executing completion if newly completed, without blocking.

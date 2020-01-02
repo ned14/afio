@@ -636,9 +636,8 @@ public:
     {
       return ntkernel_error(ntstat);
     }
-    return 1;
     // If this works, we can avoid IOCP entirely for immediately completing i/o
-    //    return !SetFileCompletionNotificationModes(h->native_handle().h, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE) ? 1 : 2;
+    return !SetFileCompletionNotificationModes(h->native_handle().h, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE) ? 1 : 2;
   }
   virtual result<void> _deregister_io_handle(handle *h) noexcept override final
   {
@@ -673,7 +672,7 @@ public:
     this_thread::delay_invoking_io_completion invoker(count);
 #ifdef LLFIO_DEBUG_PRINT
     std::cerr << "_do_complete_io _scheduled_begin = " << this->_scheduled_begin << std::endl;
-    #endif
+#endif
     if(this->_scheduled_begin != nullptr)
     {
       FILE_IO_COMPLETION_INFORMATION entries[64];

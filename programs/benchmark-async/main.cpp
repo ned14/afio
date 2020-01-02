@@ -27,10 +27,23 @@ static constexpr int BENCHMARK_DURATION = 10;
 
 static constexpr size_t THREADS = 2;
 
-/* ASIO IOCP:
+/*
+LLFIO IOCP (with Win8 IOCP packet suppression):
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 21008.4 reads 250746 cancels 227273 destroys 46082.9
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 20449.9 reads 244051 cancels 2.5e+06 destroys 40322.6
+
+Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
+   creates 21598.3 reads 251146 cancels 3.33333e+06 destroys 39525.7
+
+
+ASIO IOCP:
 
 Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
-   creates 14367.8 reads 199862 cancels 53475.9 destroys 57142.9
+   creates 11587.5 reads 203289 cancels 54054.1 destroys 55555.6
 
 Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
    creates 15873 reads 205075 cancels 57142.9 destroys 63291.1
@@ -39,7 +52,7 @@ Benchmarking struct benchmark_asio_pipe<1> with 1 handles ...
    creates 14513.8 reads 201082 cancels 58823.5 destroys 58823.5
 
 
-LLFIO IOCP:
+LLFIO IOCP (with IOCP packet per op like with ASIO):
 
 Benchmarking class llfio_v2_98e974b4::pipe_handle with 1 handles ...
    creates 22421.5 reads 200027 cancels 303030 destroys 50761.4
