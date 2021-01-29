@@ -11,37 +11,53 @@ on:
 
 jobs:
   WinVS2017:
-    name: Windows VS2017
-    runs-on: windows-2016
+    name: Visual Studio
     strategy:
       fail-fast: false
       matrix:
+        image: [windows-2016, windows-latest]
         configuration: [error_code, status_code]
-    env:
-      NAME: WinVS2017-${{ matrix.configuration }}
-          
+    runs-on: ${{ matrix.image }}
+
     steps:
     - uses: actions/checkout@v2
 
+    - name: Set name
+      id: vars
+      shell: bash
+      run: |
+       if [ "${{ matrix.image }}" = "windows-2016" ]; then
+         NAME=VS2017;
+         GENERATOR="Visual Studio 15 2017 Win64";
+       else
+         NAME=VS2019;
+         GENERATOR="Visual Studio 16 2019";
+       fi
+       echo ::set-output name=NAME::${NAME}
+       echo ::set-output name=GENERATOR::${GENERATOR}
+
+          
     - name: CMake tests Windows
       shell: bash
+      env:
+        NAME: ${{ steps.vars.outputs.NAME }}-${{ matrix.configuration }}
       run: |
        if [ "${{ matrix.configuration }}" = "status_code" ]; then
          export CMAKE_CONFIGURE_OPTIONS="-DLLFIO_USE_EXPERIMENTAL_SG14_STATUS_CODE=ON"
        fi
-       ctest -S .ci.cmake -VV --timeout 900 "-DCTEST_CONFIGURE_OPTIONS=$CMAKE_CONFIGURE_OPTIONS" -DCTEST_SITE=$NAME -DCTEST_CMAKE_GENERATOR="Visual Studio 15 2017 Win64"
+       ctest -S .ci.cmake -VV --timeout 900 "-DCTEST_CONFIGURE_OPTIONS=$CMAKE_CONFIGURE_OPTIONS" -DCTEST_SITE=$NAME -DCTEST_CMAKE_GENERATOR="${{ steps.vars.outputs.GENERATOR }}"
       
     - name: Upload Prebuilt Binaries
       uses: actions/upload-artifact@v2
       with:
-        name: Windows VS2017 ${{ matrix.configuration }} prebuilt binaries
+        name: Windows ${{ steps.vars.outputs.NAME }} ${{ matrix.configuration }} prebuilt binaries
         path: llfio-v2.0-binaries-win64.zip
       
     - name: Upload Test Results
       if: always()
       uses: actions/upload-artifact@v2
       with:
-        name: Windows VS2017 ${{ matrix.configuration }} test results
+        name: Windows ${{ steps.vars.outputs.NAME }} ${{ matrix.configuration }} test results
         path: prebuilt/merged_junit_results.xml
 
   publish-test-results:
