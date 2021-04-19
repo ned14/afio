@@ -1,7 +1,7 @@
 //! \file llfio/llfio.hpp The master *latest version* LLFIO include file. All LLFIO consuming libraries should include this header only.
 #include "version.hpp"
 
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER) && !defined(__clang__) && (!defined(_MSVC_TRADITIONAL) || _MSVC_TRADITIONAL)
 #define LLFIO_HEADERS_PATH2 LLFIO_VERSION_GLUE(v, LLFIO_HEADERS_VERSION, /llfio.hpp)
 #elif !__PCPP_ALWAYS_FALSE__
 #define LLFIO_HEADERS_PATH2 LLFIO_VERSION_GLUE(v, LLFIO_HEADERS_VERSION,)/llfio.hpp

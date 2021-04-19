@@ -48,6 +48,7 @@ endfunction()
 
 make_program(benchmark-async llfio::hl)
 make_program(benchmark-dynamic_thread_pool_group llfio::hl)
+make_program(benchmark-io-congestion llfio::hl)
 make_program(benchmark-iostreams llfio::hl)
 make_program(benchmark-locking llfio::hl kerneltest::hl)
 make_program(fs-probe llfio::hl)
@@ -56,6 +57,7 @@ make_program(key-value-store llfio::hl)
 
 target_include_directories(benchmark-async PRIVATE "asio/asio/include")
 target_include_directories(benchmark-dynamic_thread_pool_group PRIVATE "asio/asio/include")
+target_include_directories(benchmark-io-congestion PRIVATE "asio/asio/include")
 
 if(MSVC)
   target_compile_options(illegal-codepoints PUBLIC /utf-8)

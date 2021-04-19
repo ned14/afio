@@ -9,41 +9,9 @@ These compilers and OSs are regularly tested:
 
 Other compilers, architectures and OSs may work, but are not tested regularly.
 You will need a working [Filesystem TS](https://en.cppreference.com/w/cpp/experimental/fs)
-implementation in your STL, and at least C++ 14. 
+implementation in your STL, and at least C++ 14.
 
-## Get a copy of the source
-
-Download [this archive](https://dedi5.nedprod.com/static/files/llfio-v2-source-latest.tar.xz)
-or clone from the GitHub repository:
-
-~~~
-git config --system core.longpaths true
-git clone --recursive https://github.com/ned14/llfio.git
-cd llfio
-~~~
-
-The first command is relevant so deeply nested paths on Windows will work when
-cloning the repository and submodules. It may require elevated privileges, but
-you can also use `git config --global core.longpaths true` instead.
-
-### If you already cloned before reading this
-
-If you had already cloned _this_ repository, but didn't use the `--recursive`
-switch, you can simply run the following command from inside the work tree:
-
-~~~
-git submodule update --init --recursive
-~~~
-
-## Header only usage
-
-LLFIO defaults to header only library configuration, so you don't actually need
-any of the prebuilt binaries below, or to build anything. Simply:
-
-~~~cpp
-#include "llfio/include/llfio.hpp"
-~~~
-
+LLFIO has your choice of header-only, static library, and shared library build modes.
 Note that on Microsoft Windows, the default header only configuration is unsafe
 to use outside of toy projects. You will get warnings of the form:
 
@@ -67,14 +35,50 @@ which doesn't have this problem (define `LLFIO_EXPERIMENTAL_STATUS_CODE=1`)
 documentation](https://github.com/ned14/ntkernel-error-category)) (iii)
 Don't use header only LLFIO on Windows (see below).
 
+
+## Install from the vcpkg package manager
+
+This is particularly easy, and works on Mac OS, Linux and Microsoft Windows:
+
+```
+vcpkg install llfio
+```
+
+LLFIO appears at `<llfio/llfio.hpp>`.
+
 ## Prebuilt binaries
 
 It is faster to build programs using LLFIO if you don't use a header only build.
-In this situation, define `LLFIO_HEADERS_ONLY=0`, and choose one of `LLFIO_DYN_LINK` or `LLFIO_STATIC_LINK` depending on whether you are using the prebuilt shared or static libraries respectively.
+In this situation, define `LLFIO_HEADERS_ONLY=0`, and choose one of `LLFIO_DYN_LINK`
+or `LLFIO_STATIC_LINK` depending on whether you are using the prebuilt shared or
+static libraries respectively.
 
-- https://dedi5.nedprod.com/static/files/llfio-v2-binaries-darwin-latest.zip
-- https://dedi5.nedprod.com/static/files/llfio-v2-binaries-linux64-latest.tgz
-- https://dedi5.nedprod.com/static/files/llfio-v2-binaries-win64-latest.zip
+You can find prebuilt binaries for Mac OS, Ubuntu and Microsoft Windows at
+https://github.com/ned14/llfio/releases. Choose a release, and under the Assets
+you will find the prebuilt binaries packages which include headers.
+
+## Get a copy of the source
+
+Clone from the GitHub repository:
+
+~~~
+git config --system core.longpaths true
+git clone --recursive https://github.com/ned14/llfio.git
+cd llfio
+~~~
+
+The first command is relevant so deeply nested paths on Windows will work when
+cloning the repository and submodules. It may require elevated privileges, but
+you can also use `git config --global core.longpaths true` instead.
+
+### If you already cloned before reading this
+
+If you had already cloned _this_ repository, but didn't use the `--recursive`
+switch, you can simply run the following command from inside the work tree:
+
+~~~
+git submodule update --init --recursive
+~~~
 
 ## Build static libraries from source
 

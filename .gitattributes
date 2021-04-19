@@ -1,6 +1,11 @@
 * text=auto !eol svneol=native#text/plain
 *.gitattributes text svneol=native#text/plain
 
+cmake/headers.cmake eol=lf
+cmake/interface.cmake eol=lf
+cmake/sources.cmake eol=lf
+cmake/tests.cmake eol=lf
+
 # Scriptish formats
 *.bat        text svneol=native#text/plain
 *.bsh        text svneol=native#text/x-beanshell

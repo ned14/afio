@@ -23,7 +23,7 @@
 #define LLFIO_NAMESPACE_VERSION LLFIO_VERSION_GLUE(LLFIO_VERSION_MAJOR, _, LLFIO_VERSION_MINOR)
 
 #if defined(__cpp_modules) || defined(DOXYGEN_SHOULD_SKIP_THIS)
-#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_MSC_VER) && !defined(__clang__) && (!defined(_MSVC_TRADITIONAL) || _MSVC_TRADITIONAL)
 //! \brief The LLFIO C++ module name
 #define LLFIO_MODULE_NAME LLFIO_VERSION_GLUE(llfio_v, LLFIO_NAMESPACE_VERSION, )
 #else

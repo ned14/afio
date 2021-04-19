@@ -1261,7 +1261,6 @@ class dynamic_thread_pool_group_impl final : public dynamic_thread_pool_group
 #else
   void *_grouph{nullptr};
   size_t _newly_added_active_work_items{0};
-  size_t _timer_work_items_remaining{0};
   size_t _active_work_items_remaining{0};
 #endif
 

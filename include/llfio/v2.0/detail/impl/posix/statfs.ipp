@@ -438,8 +438,7 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<std::pair<uint32_t, float>> statfs_t::_fi
             int major = 0, minor = 0;
             char devicename[64];
             size_t fields[12];
-            sscanf(sv.data(), "%d %d %s %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu", &major, &minor, devicename, fields + 0, fields + 1, fields + 2, fields + 3,
-                   fields + 4, fields + 5, fields + 6, fields + 7, fields + 8, fields + 9);
+            sscanf(sv.data(), "%d %d %s %*u %*u %*u %*u %*u %*u %*u %*u %zu %zu", &major, &minor, devicename, fields + 8, fields + 9);
             std::lock_guard<std::mutex> g(last_reading.lock);
             auto it = last_reading.items.begin();
             for(; it != last_reading.items.end(); ++it)

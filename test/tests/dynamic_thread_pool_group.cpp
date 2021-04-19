@@ -346,10 +346,10 @@ static inline void TestDynamicThreadPoolGroupNestingWorks()
 
 static inline void TestDynamicThreadPoolGroupIoAwareWorks()
 {
-  // statfs_t::iosinprogress not implemented for these yet
-#if defined(__APPLE__) || defined(__FreeBSD__)
-  return;
-#endif
+  if(getenv("CI") != nullptr)
+  {
+    return;
+  }
   namespace llfio = LLFIO_V2_NAMESPACE;
   static constexpr size_t WORK_ITEMS = 1000;
   static constexpr size_t IO_SIZE = 1 * 65536;
@@ -401,13 +401,46 @@ static inline void TestDynamicThreadPoolGroupIoAwareWorks()
                    .value();
   shared_state.awareness.h = &shared_state.h;
   shared_state.h.truncate(WORK_ITEMS * IO_SIZE).value();
+  {
+    auto print_statfs = [](const llfio::file_handle &h, const llfio::statfs_t &statfs) {
+      std::cout << "\nFor file " << h.current_path().value() << ":";
+      std::cout << "\n fundamental filesystem block size = " << statfs.f_bsize;
+      std::cout << "\n optimal transfer block size = " << statfs.f_iosize;
+      std::cout << "\n total data blocks in filesystem = " << statfs.f_blocks;
+      std::cout << "\n free blocks in filesystem = " << statfs.f_bfree;
+      std::cout << "\n free blocks avail to non-superuser = " << statfs.f_bavail;
+      std::cout << "\n total file nodes in filesystem = " << statfs.f_files;
+      std::cout << "\n free nodes avail to non-superuser = " << statfs.f_ffree;
+      std::cout << "\n maximum filename length = " << statfs.f_namemax;
+      std::cout << "\n filesystem type name = " << statfs.f_fstypename;
+      std::cout << "\n mounted filesystem = " << statfs.f_mntfromname;
+      std::cout << "\n directory on which mounted = " << statfs.f_mntonname;
+      std::cout << "\n i/o's currently in progress (i.e. queue depth) = " << statfs.f_iosinprogress;
+      std::cout << "\n percentage of time spent doing i/o (1.0 = 100%) = " << statfs.f_iosbusytime;
+      std::cout << std::endl;
+    };
+    llfio::statfs_t s;
+    s.fill(shared_state.h).value();
+    print_statfs(shared_state.h, s);
+  }
   alignas(4096) llfio::byte buffer[IO_SIZE];
   llfio::utils::random_fill((char *) buffer, sizeof(buffer));
   std::vector<work_item> workitems;
-  for(size_t n = 0; n < WORK_ITEMS; n++)
+  try
   {
-    workitems.emplace_back(&shared_state);
-    shared_state.h.write(n * IO_SIZE, {{buffer, sizeof(buffer)}}).value();
+    for(size_t n = 0; n < WORK_ITEMS; n++)
+    {
+      workitems.emplace_back(&shared_state);
+      shared_state.h.write(n * IO_SIZE, {{buffer, sizeof(buffer)}}).value();
+    }
+  }
+  catch(const std::runtime_error &e)
+  {
+    std::cout << "\nNOTE: Received exception '" << e.what()
+              << "' when trying to construct dynamic_thread_pool_group::io_aware_work_item, assuming this platform does not implement statfs::f_iosinprogress "
+                 "and skipping test."
+              << std::endl;
+    return;
   }
   auto tpg = llfio::make_dynamic_thread_pool_group().value();
   tpg->submit(llfio::span<work_item>(workitems)).value();
@@ -446,5 +479,5 @@ KERNELTEST_TEST_KERNEL(integration, llfio, dynamic_thread_pool_group, works, "Te
                        TestDynamicThreadPoolGroupWorks())
 KERNELTEST_TEST_KERNEL(integration, llfio, dynamic_thread_pool_group, nested, "Tests that nesting of llfio::dynamic_thread_pool_group works as expected",
                        TestDynamicThreadPoolGroupNestingWorks())
-// KERNELTEST_TEST_KERNEL(integration, llfio, dynamic_thread_pool_group, io_aware_work_item,
-//                       "Tests that llfio::dynamic_thread_pool_group::io_aware_work_item works as expected", TestDynamicThreadPoolGroupIoAwareWorks())
+KERNELTEST_TEST_KERNEL(integration, llfio, dynamic_thread_pool_group, io_aware_work_item,
+                       "Tests that llfio::dynamic_thread_pool_group::io_aware_work_item works as expected", TestDynamicThreadPoolGroupIoAwareWorks())
