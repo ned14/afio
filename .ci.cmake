@@ -7,6 +7,12 @@ include(QuickCppLibUtils)
 CONFIGURE_CTEST_SCRIPT_FOR_CDASH("llfio" "prebuilt")
 #list(APPEND CTEST_CONFIGURE_OPTIONS -DCMAKE_BUILD_TYPE=${CTEST_CONFIGURATION_TYPE} -DCXX_COROUTINES_FLAGS=)
 ctest_empty_binary_directory(${CTEST_BINARY_DIRECTORY})
+if(WIN32)
+  find_program(BASH_COMMAND bash HINTS "C:/Program Files/Git/bin")
+  checked_execute_process("Checking bash binary works"
+    COMMAND "${BASH_COMMAND}" --version
+  )
+endif()
 include(FindGit)
 set(CTEST_GIT_COMMAND "${GIT_EXECUTABLE}")
 
@@ -79,8 +85,8 @@ if(WIN32)
       )
     endif()
     checked_execute_process("Tarring up binaries 9"
-      COMMAND bash -c "mv ned14-outcome* llfio/include/outcome"
-      COMMAND bash -c "mv ned14-quickcpplib* llfio/include/quickcpplib"
+      COMMAND "${BASH_COMMAND}" -c "mv ned14-outcome* llfio/include/outcome"
+      COMMAND "${BASH_COMMAND}" -c "mv ned14-quickcpplib* llfio/include/quickcpplib"
     )
     checked_execute_process("Tarring up binaries final"
       COMMAND "${CMAKE_COMMAND}" -E tar cfv llfio-v2.0-binaries-win64.zip --format=zip llfio/
